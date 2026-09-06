@@ -302,6 +302,7 @@ def one_liner(machine: dict, base: str) -> str:
 def client_script(machine: dict, base: str, host: str, settings: dict) -> str:
     share = settings.get("smb_share") or "models"
     user = machine.get("smb_user") or settings.get("smb_user") or "guest"
+    user_source = "machine" if machine.get("smb_user") else "global"
     password = "" if user == "guest" else (settings.get("smb_password") or "")
     values = {
         "NAS": base,
@@ -314,6 +315,7 @@ def client_script(machine: dict, base: str, host: str, settings: dict) -> str:
         "SMB_SHARE_URL": quote(share, safe=""),
         "SMB_SHARE_FSTAB": share.replace(" ", "\\040"),
         "SMB_USER": user,
+        "SMB_USER_SOURCE": user_source,
         "SMB_USER_URL": quote(user, safe=""),
         "SMB_PASS": password.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "\\`"),
         "SMB_PASS_URL": quote(password, safe=""),
@@ -334,7 +336,7 @@ _CLIENT_TEMPLATE = r'''#!/usr/bin/env bash
 NAS="@@NAS@@"; MACHINE="@@MACHINE@@"; OS="@@OS@@"
 MODELS_DIR="@@MODELS_DIR@@"; MOUNT="@@MOUNT@@"; LIB="$MOUNT/lmstudio"
 SMB_HOST="@@SMB_HOST@@"; SMB_SHARE="@@SMB_SHARE@@"; SMB_SHARE_URL="@@SMB_SHARE_URL@@"; SMB_SHARE_FSTAB="@@SMB_SHARE_FSTAB@@"
-SMB_USER="@@SMB_USER@@"; SMB_USER_URL="@@SMB_USER_URL@@"; SMB_PASS="@@SMB_PASS@@"; SMB_PASS_URL="@@SMB_PASS_URL@@"
+SMB_USER="@@SMB_USER@@"; SMB_USER_URL="@@SMB_USER_URL@@"; SMB_PASS="@@SMB_PASS@@"; SMB_PASS_URL="@@SMB_PASS_URL@@"; SMB_USER_SOURCE="@@SMB_USER_SOURCE@@"
 
 AUTO=0; REPORT_ONLY=0; YES=0; UPLOAD=""
 while [ $# -gt 0 ]; do
@@ -415,8 +417,21 @@ cifs_cred() {
   elif [ -n "$SMB_PASS" ]; then printf 'username=%s,password=%s' "$SMB_USER" "$SMB_PASS"
   else printf 'username=%s' "$SMB_USER"; fi
 }
+mac_session_user() {  # account of an existing SMB connection from this Mac to the NAS, if any (macOS keeps one session per server)
+  mount 2>/dev/null | awk -v h="$(printf '%s' "$SMB_HOST" | tr 'A-Z' 'a-z')" '
+    $1 ~ /^\/\// { split(substr($1, 3), a, "@"); if (length(a) == 2) { split(a[2], b, "/"); if (tolower(b[1]) == h) { print a[1]; exit } } }'
+}
+adopt_mac_session() {  # with the global default account, reuse whatever account this Mac is already connected with
+  local u
+  [ "$OS" = mac ] && [ "$SMB_USER_SOURCE" = global ] || return 0
+  u=$(mac_session_user)
+  [ -n "$u" ] && [ "$u" != "$SMB_USER" ] || return 0
+  printf '%sThis Mac is already connected to %s as %s; using that account for the library mount so the existing connection is kept (password from your Keychain).%s\n' "$D" "$SMB_HOST" "$u" "$R"
+  SMB_USER="$u"; SMB_USER_URL=$(urlencode "$u"); SMB_PASS=""; SMB_PASS_URL=""
+}
 ensure_mount() {
   [ -d "$LIB" ] && return 0
+  adopt_mac_session
   echo "Mounting //$SMB_HOST/$SMB_SHARE at $MOUNT as $SMB_USER ..."
   if [ "$OS" = mac ]; then
     mkdir -p "$MOUNT" 2>/dev/null || true
@@ -682,10 +697,10 @@ choose_upload() {
 # ----- login-time mount -----
 setup_mount() {
   if [ "$OS" = mac ]; then
-    local flag="" plist="$HOME/Library/LaunchAgents/lmscache.mount.plist" url
+    local flag="-N " plist="$HOME/Library/LaunchAgents/lmscache.mount.plist" url
+    adopt_mac_session
     url=$(smb_url)
-    if [ "$SMB_USER" = guest ] || [ -n "$SMB_PASS" ]; then flag="-N "
-    else echo "Account $SMB_USER has no password stored in LMS Cache: connect once in Finder with 'Remember this password in my keychain', or the login-time mount cannot run unattended."; fi
+    if [ "$SMB_USER" != guest ] && [ -z "$SMB_PASS" ]; then echo "Account $SMB_USER: the login-time mount uses the password saved in your Keychain. If Finder has never remembered it for $SMB_HOST, connect once with 'Remember this password in my keychain'."; fi
     mkdir -p "$MOUNT" "$HOME/Library/LaunchAgents"
     cat > "$plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

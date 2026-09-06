@@ -144,6 +144,10 @@ speed and time left, measured from bytes that actually landed.
 
 - *Mount fails or the library folder is empty*: check that the SMB account has read access to the share
   (`smbutil view //account@nas` on macOS lists what it can see) and that the share name in Settings matches.
+- *On a Mac, Finder's connection to the NAS switched to the read-only account*: macOS keeps one SMB session per
+  server. Set that machine's SMB account override to the account you normally use; the script then mounts with it
+  (password from Keychain or a prompt). With the global account, the script also detects an existing session and
+  reuses its account automatically.
 - *A model shows partial*: set Cached again; rsync resumes the copy.
 - *Upload interrupted*: run the same command again; it continues from what the NAS already has.
 - *Deploying says transfers are in progress*: an upload or download is running; wait, or `deploy.sh up --force`.

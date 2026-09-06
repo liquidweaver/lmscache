@@ -73,7 +73,7 @@
         <label>OS <select name="os"><option value="mac">macOS</option><option value="linux">Linux</option></select></label>
         <label>LM Studio models folder <input name="models_dir" placeholder="~/.lmstudio/models"></label>
         <label>Mount point for the library share <input name="mount" placeholder="/Users/Shared/lmscache"></label>
-        <label>SMB account override <input name="smb_user" placeholder="use the global setting"></label>
+        <label>SMB account override <span class="hint">a Mac keeps one SMB session per server: if this computer already connects to the NAS as you, put that account here (no password stored; Keychain or a prompt supplies it) so the script does not replace your session</span><input name="smb_user" placeholder="use the global setting"></label>
         <div class="row"><button type="submit" class="primary">Save machine</button><button type="button" id="machine-cancel">Cancel</button></div>
       </form>
     </details>
