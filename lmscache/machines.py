@@ -551,14 +551,18 @@ PLIST
     if grep -q " $MOUNT " /etc/fstab; then echo "/etc/fstab already has an entry for $MOUNT."
     else echo "//$SMB_HOST/$SMB_SHARE_FSTAB $MOUNT cifs $cred,ro,soft,vers=3.1.1,uid=$(id -u),gid=$(id -g),iocharset=utf8,noauto,x-systemd.automount,x-systemd.idle-timeout=600,_netdev 0 0" | sudo tee -a /etc/fstab >/dev/null; fi
     unit=$(systemd-escape -p --suffix=automount "$MOUNT")
-    sudo systemctl daemon-reload && sudo systemctl start "$unit" && echo "Installed: $MOUNT mounts on first access (systemd automount $unit)."
+    if mountpoint -q "$MOUNT" 2>/dev/null; then
+      # the temporary mount made earlier in this run blocks the automount ("already a mount point")
+      sudo umount "$MOUNT" || { printf '%sCould not unmount the temporary mount at %s; close anything using it and choose m again.%s\n' "$Y" "$MOUNT" "$R"; return 1; }
+    fi
+    sudo systemctl daemon-reload && sudo systemctl restart "$unit" && echo "Installed: $MOUNT mounts on first access (systemd automount $unit)."
   fi
   sleep 1
   if [ -d "$LIB" ]; then echo "Library is reachable at $LIB."; else printf '%sLibrary is not reachable yet; check the share permissions for %s.%s\n' "$Y" "$SMB_USER" "$R"; fi
 }
 
-report() {
-  local pub repo state bytes target free total first json here
+report() {  # $1 = quiet -> no output on success
+  local pub repo state bytes target free total first json here quiet="${1:-}"
   here=$(pwd)
   cd "$MODELS_DIR" 2>/dev/null || { echo "models folder not found: $MODELS_DIR" >&2; return 1; }
   free=$(df -Pk . | awk 'NR==2{printf "%.0f", $4*1024}'); total=$(df -Pk . | awk 'NR==2{printf "%.0f", $2*1024}')
@@ -584,7 +588,7 @@ report() {
   json="$json]}"
   cd "$here"
   if printf '%s' "$json" | curl -fsS -X POST -H 'Content-Type: application/json' --data-binary @- "$NAS/api/machines/$MACHINE/report" >/dev/null; then
-    printf '%sReported %s state to LMS Cache.%s\n' "$G" "$MACHINE" "$R"
+    [ -n "$quiet" ] || printf '%sReported %s state to LMS Cache.%s\n' "$G" "$MACHINE" "$R"
   else
     echo "Could not send the report to $NAS" >&2
   fi
@@ -601,6 +605,7 @@ main() {
   if [ -n "$UPLOAD" ]; then scan_local; list_foreign >/dev/null; upload_model "$UPLOAD"; report; exit $?; fi
   ensure_mount || printf '%sThe library share is not mounted; caching and linking will fail until it is.%s\n' "$Y" "$R"
   scan_local
+  report quiet
   if [ $AUTO -eq 1 ]; then
     render
     [ $PEND -gt 0 ] && apply_pending
