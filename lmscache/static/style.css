@@ -134,3 +134,5 @@ ul.files li span:last-child { margin-left: auto; color: var(--muted); }
 .toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); background: var(--text); color: var(--bg); padding: 10px 16px; border-radius: 8px; z-index: 30; max-width: 80vw; box-shadow: 0 6px 24px rgba(0,0,0,.25); }
 .toast.bad { background: var(--bad); color: #fff; }
 .empty { padding: 28px; text-align: center; color: var(--muted); }
+.tag.quant { font-family: var(--mono); color: var(--text); background: var(--accent-soft); border-color: transparent; }
+table.grid tr.repo-more td.model { color: var(--muted); }

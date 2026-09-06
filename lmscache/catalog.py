@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 from . import config, db
-from .util import detect_quant, is_mmproj, valid_repo_id
+from .util import detect_quant, is_mmproj, quant_rank, valid_repo_id, variants_for
 
 _lock = threading.Lock()
 _models: dict[str, dict] = {}
@@ -84,12 +84,18 @@ def scan() -> dict[str, dict]:
                     mtime = repo.stat().st_mtime
                 except OSError:
                     mtime = time.time()
+                variants, shared = variants_for(fmt, repo.name, files)
                 found[mid] = {
                     "id": mid,
                     "publisher": pub.name,
                     "repo": repo.name,
                     "format": fmt,
-                    "quants": quants_for(fmt, repo.name, paths),
+                    "quants": [v["key"] for v in variants],
+                    "variants": [
+                        {"id": f"{mid}@{v['key']}", "key": v["key"], "label": v["label"], "kind": v["kind"], "files": v["files"], "bytes": v["size"], "file_count": len(v["files"])}
+                        for v in sorted(variants, key=lambda v: quant_rank(v["key"]))
+                    ],
+                    "shared": shared,
                     "files": files,
                     "file_count": len(files),
                     "total_bytes": sum(f["size"] for f in files),
@@ -122,9 +128,47 @@ def summary() -> list[dict]:
     """Catalog without per-file lists, for the state payload."""
     out = []
     for m in models().values():
-        out.append({k: v for k, v in m.items() if k != "files"})
+        slim = {k: v for k, v in m.items() if k not in ("files", "shared", "variants")}
+        slim["variants"] = [{k: v for k, v in var.items() if k != "files"} for var in m["variants"]]
+        slim["shared_count"] = len(m.get("shared") or [])
+        out.append(slim)
     out.sort(key=lambda m: m["id"].lower())
     return out
+
+
+def variant(vid: str) -> tuple[dict, dict] | None:
+    """(model, variant) for a variant id like publisher/repo@Q4_K_M."""
+    repo_id, _, key = vid.partition("@")
+    m = get(repo_id)
+    if not m:
+        return None
+    for v in m["variants"]:
+        if v["key"] == key:
+            return m, v
+    return None
+
+
+def delete_variant(vid: str) -> None:
+    found = variant(vid)
+    if not found:
+        raise ValueError("no such variant")
+    model, var = found
+    if len(model["variants"]) <= 1:
+        delete_model(model["id"])
+        return
+    root = (config.LIBRARY_DIR / model["id"]).resolve()
+    for f in var["files"]:
+        target = (root / f["path"]).resolve()
+        if root not in target.parents:
+            continue
+        target.unlink(missing_ok=True)
+    for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+        if dirpath != str(root) and not dirnames and not filenames:
+            try:
+                os.rmdir(dirpath)
+            except OSError:
+                pass
+    scan()
 
 
 def remember(mid: str, meta: dict) -> None:

@@ -8,7 +8,7 @@ import re
 from huggingface_hub import HfApi
 
 from .catalog import detect_format
-from .util import detect_quant, is_mmproj
+from .util import group_files
 
 SORT_MAP = {"downloads": "downloads", "likes": "likes", "updated": "lastModified", "trending": "trendingScore"}
 FORMAT_TAG = {"gguf": "gguf", "mlx": "mlx", "safetensors": "safetensors"}
@@ -66,41 +66,6 @@ def _search_sync(q: str, fmt: str, sort: str, limit: int, token: str | None) -> 
 
 async def search(q: str, fmt: str, sort: str, limit: int, token: str | None) -> list[dict]:
     return await asyncio.to_thread(_search_sync, q, fmt, sort, limit, token)
-
-
-def _quant_rank(key: str) -> tuple:
-    m = re.search(r"(\d+)", key)
-    bits = int(m.group(1)) if m else 99
-    if key.upper() in ("F16", "BF16", "FP16"):
-        bits = 16
-    if key.upper() in ("F32",):
-        bits = 32
-    if key.upper() in ("FP8",):
-        bits = 8
-    return (bits, key)
-
-
-def group_files(files: list[dict], fmt: str) -> list[dict]:
-    total = sum(f["size"] or 0 for f in files)
-    if fmt != "gguf":
-        return [{"key": "all", "label": "Whole repository", "kind": "all", "files": files, "size": total}]
-    buckets: dict[str, list[dict]] = {}
-    for f in files:
-        p = f["path"]
-        if p.lower().endswith(".gguf"):
-            key = "mmproj" if is_mmproj(p) else (detect_quant(p) or "gguf")
-        else:
-            key = "other"
-        buckets.setdefault(key, []).append(f)
-    quant_keys = sorted((k for k in buckets if k not in ("mmproj", "other")), key=_quant_rank)
-    groups = []
-    for k in quant_keys:
-        groups.append({"key": k, "label": k, "kind": "quant", "files": buckets[k], "size": sum(x["size"] or 0 for x in buckets[k])})
-    if "mmproj" in buckets:
-        groups.append({"key": "mmproj", "label": "Vision projector (mmproj)", "kind": "mmproj", "files": buckets["mmproj"], "size": sum(x["size"] or 0 for x in buckets["mmproj"])})
-    if "other" in buckets:
-        groups.append({"key": "other", "label": "Other files (README, imatrix, configs)", "kind": "other", "files": buckets["other"], "size": sum(x["size"] or 0 for x in buckets["other"])})
-    return groups
 
 
 def _repo_info_sync(repo_id: str, token: str | None) -> dict:

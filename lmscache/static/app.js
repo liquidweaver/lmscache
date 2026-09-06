@@ -121,43 +121,47 @@
         </span>`;
     }
 
-    const models = d.models.filter((m) => {
+    const rows = [];
+    for (const m of d.models) for (const v of m.variants || []) rows.push({ m, v });
+    const shown = rows.filter(({ m, v }) => {
       if (S.fmt !== "any" && m.format !== S.fmt) return false;
-      if (S.filter && !m.id.toLowerCase().includes(S.filter)) return false;
+      if (S.filter && !(m.id + " " + v.key).toLowerCase().includes(S.filter)) return false;
       return true;
     });
     const totalBytes = d.models.reduce((a, m) => a + (m.total_bytes || 0), 0);
-    $("#lib-summary").textContent = `${d.models.length} models, ${hb(totalBytes)} in the library · ${hb(d.disk.free)} free on the NAS`;
+    $("#lib-summary").textContent = `${rows.length} quant${rows.length === 1 ? "" : "s"} in ${d.models.length} repo${d.models.length === 1 ? "" : "s"}, ${hb(totalBytes)} in the library · ${hb(d.disk.free)} free on the NAS`;
 
-    const machineCols = d.machines.map((m) => `<th class="${m.name === S.machine ? "me" : ""}" title="${m.report ? "reported " + esc(ago(m.report.at)) : "no report yet"}">${esc(m.name)}${m.report ? "" : " <span class='muted'>?</span>"}</th>`).join("");
-    let html = `<thead><tr><th>Model</th><th>Format</th><th>Quant</th><th>Size</th><th>Added</th>${machineCols}<th></th></tr></thead><tbody>`;
-    if (!models.length) {
-      html += `<tr><td colspan="${6 + d.machines.length}"><div class="empty">${d.models.length ? "Nothing matches the filter." : "The library is empty. Use Search to download a model."}</div></td></tr>`;
+    const machineCols = d.machines.map((m) => `<th class="${m.name === S.machine ? "me" : ""}" title="${m.report ? "reported " + esc(ago(m.report.at)) : "no report yet"}">${esc(m.name)}${m.report && !m.report.stale ? "" : " <span class='muted'>?</span>"}</th>`).join("");
+    let html = `<thead><tr><th>Model</th><th>Quant</th><th>Format</th><th>Size</th><th>Added</th>${machineCols}<th></th></tr></thead><tbody>`;
+    if (!shown.length) {
+      html += `<tr><td colspan="${6 + d.machines.length}"><div class="empty">${rows.length ? "Nothing matches the filter." : "The library is empty. Use Search to download a model."}</div></td></tr>`;
     }
-    for (const m of models) {
-      html += `<tr>
-        <td class="model" title="${esc(m.id)}"><a href="#" data-model-detail="${esc(m.id)}">${esc(m.id)}</a></td>
+    let lastRepo = null;
+    for (const { m, v } of shown) {
+      const first = m.id !== lastRepo; lastRepo = m.id;
+      html += `<tr class="${first ? "repo-first" : "repo-more"}">
+        <td class="model" title="${esc(m.id)}">${first ? `<a href="#" data-model-detail="${esc(m.id)}">${esc(m.id)}</a>` : `<span class="muted">〃</span>`}</td>
+        <td><span class="tag quant">${esc(v.label)}</span></td>
         <td><span class="tag ${esc(m.format)}">${esc(m.format)}</span></td>
-        <td class="muted">${esc((m.quants || []).join(", "))}</td>
-        <td class="num">${hb(m.total_bytes)}</td>
+        <td class="num">${hb(v.bytes)}</td>
         <td class="muted">${dateShort(m.added_at)}</td>`;
       for (const mc of d.machines) {
-        const cell = d.cells?.[mc.name]?.[m.id] || { reported: null, bytes: 0, intent: null, pending: false };
-        html += `<td class="${mc.name === S.machine ? "me" : ""}">${cellHtml(mc.name, m, cell)}</td>`;
+        const cell = d.cells?.[mc.name]?.[v.id] || { reported: null, bytes: 0, intent: null, pending: false };
+        html += `<td class="${mc.name === S.machine ? "me" : ""}">${cellHtml(mc.name, v.id, v.bytes, cell)}</td>`;
       }
-      html += `<td class="actions"><button class="danger" data-delete="${esc(m.id)}" title="Delete from the library">Delete</button></td></tr>`;
+      html += `<td class="actions"><button class="danger" data-delete-variant="${esc(v.id)}" title="Delete this quant from the library">Delete</button></td></tr>`;
     }
     html += "</tbody>";
     $("#lib-table").innerHTML = html;
   }
 
-  function cellHtml(machine, model, cell) {
+  function cellHtml(machine, variantId, totalBytes, cell) {
     const rep = cell.reported;
     const intent = cell.intent;
     const actual = rep === "partial" ? "cached" : rep;
     const shown = actual || intent || "absent";
     const unknown = rep === null;
-    let html = `<div class="seg ${unknown ? "unknown" : ""}" data-machine="${esc(machine)}" data-model="${esc(model.id)}">`;
+    let html = `<div class="seg ${unknown ? "unknown" : ""}" data-machine="${esc(machine)}" data-model="${esc(variantId)}">`;
     for (const [st, label, title] of STATES) {
       const cls = [];
       if (st === shown) cls.push("on", st);
@@ -165,7 +169,7 @@
       html += `<button class="${cls.join(" ")}" data-state="${st}" title="${title}${intent === st && cell.pending ? " (wanted, not applied yet)" : ""}">${label}</button>`;
     }
     html += `</div>`;
-    if (rep === "partial") html += `<div class="sub warn">partial: ${hb(cell.bytes)} of ${hb(model.total_bytes)}</div>`;
+    if (rep === "partial") html += `<div class="sub warn">partial: ${hb(cell.bytes)} of ${hb(totalBytes)}</div>`;
     else if (cell.pending) html += `<div class="sub pending">wanted: ${esc(intent)}</div>`;
     else if (unknown && intent) html += `<div class="sub">wanted: ${esc(intent)}, no report yet</div>`;
     return html;
@@ -198,7 +202,7 @@
       const m = await api(`/api/library/${id}`);
       const hf = m.hf || {};
       let html = `<div class="kv">
-        <div>Format</div><div><span class="tag ${esc(m.format)}">${esc(m.format)}</span> ${esc((m.quants || []).join(", "))}</div>
+        <div>Format</div><div><span class="tag ${esc(m.format)}">${esc(m.format)}</span> ${(m.variants || []).length} quant${(m.variants || []).length === 1 ? "" : "s"}</div>
         <div>Size</div><div>${hb(m.total_bytes)} in ${m.file_count} files</div>
         <div>Added</div><div>${dateShort(m.added_at)}</div>
         ${m.revision ? `<div>Revision</div><div><code>${esc(m.revision.slice(0, 12))}</code></div>` : ""}
@@ -208,20 +212,22 @@
         <div>On the share</div><div><code>lmstudio/${esc(m.id)}</code></div>
         <div>Hub page</div><div><a href="https://huggingface.co/${esc(m.id)}" target="_blank" rel="noopener">huggingface.co/${esc(m.id)}</a></div>
       </div>
-      <h4>Files</h4><ul class="files">${m.files.map((f) => `<li><span>${esc(f.path)}</span><span>${hb(f.size)}</span></li>`).join("")}</ul>`;
+      ${(m.variants || []).map((v) => `<h4><span class="tag quant">${esc(v.label)}</span> ${hb(v.bytes)}</h4><ul class="files">${v.files.map((f) => `<li><span>${esc(f.path)}</span><span>${hb(f.size)}</span></li>`).join("")}</ul>`).join("")}
+      ${(m.shared || []).length ? `<h4>Shared by every quant</h4><ul class="files">${m.shared.map((f) => `<li><span>${esc(f.path)}</span><span>${hb(f.size)}</span></li>`).join("")}</ul>` : ""}`;
       $("#drawer-body").innerHTML = html;
     } catch (e) { $("#drawer-body").innerHTML = `<div class="error">${esc(e.message)}</div>`; }
   }
 
-  async function deleteModel(id) {
-    const linked = S.data.machines.filter((m) => (S.data.cells?.[m.name]?.[id] || {}).reported === "linked").map((m) => m.name);
-    let msg = `Delete ${id} from the library on the NAS?`;
+  async function deleteVariant(vid) {
+    const [repo, key] = vid.split("@");
+    const linked = S.data.machines.filter((m) => (S.data.cells?.[m.name]?.[vid] || {}).reported === "linked").map((m) => m.name);
+    let msg = `Delete ${vid} from the library on the NAS?`;
     if (linked.length) msg += `\n\nThese machines link to it and will lose it: ${linked.join(", ")}.`;
     msg += "\n\nLocal cached copies on machines are not touched.";
     if (!confirm(msg)) return;
     try {
-      await api(`/api/library/${id}`, { method: "DELETE" });
-      toast(`Deleted ${id}.`);
+      await api(`/api/library/${repo}?variant=${encodeURIComponent(key)}`, { method: "DELETE" });
+      toast(`Deleted ${vid}.`);
       await refresh();
     } catch (e) { toast(e.message, true); }
   }
@@ -357,17 +363,16 @@
         const foreign = d.foreign?.[m.name] || [];
         return `<div class="card" data-machine-card="${esc(m.name)}">
           <div class="head"><span class="title">${esc(m.name)}</span><span class="tag">${m.os === "mac" ? "macOS" : "Linux"}</span>
-            <span class="meta">${rep ? `reported ${esc(ago(rep.at))} · ${esc(hb(rep.free_bytes))} free of ${esc(hb(rep.total_bytes))} · ${rep.count} local model${rep.count === 1 ? "" : "s"}` : "never reported: run the command once"}</span>
+            <span class="meta">${rep ? (rep.stale ? `report from an older client version (${esc(ago(rep.at))}): run the command again` : `reported ${esc(ago(rep.at))} · ${esc(hb(rep.free_bytes))} free of ${esc(hb(rep.total_bytes))} · ${rep.count} local model folder${rep.count === 1 ? "" : "s"}`) : "never reported: run the command once"}</span>
             <span class="spacer"></span><button data-machine-edit="${esc(m.name)}">Edit</button><button class="danger" data-machine-delete="${esc(m.name)}">Delete</button></div>
           <div class="kv">
             <div>Models folder</div><div><code>${esc(m.models_dir)}</code></div>
             <div>Library mounted at</div><div><code>${esc(m.mount)}</code> <span class="muted">(share //${esc(d.settings.smb_host || "this host")}/${esc(d.settings.smb_share)} as ${esc(m.smb_user || d.settings.smb_user || "guest")})</span></div>
-            <div>Link mode</div><div>${m.link_mode === "files" ? "per-file symlinks" : "folder symlink"}</div>
           </div>
           <div class="row"><span class="muted">Run in a terminal on ${esc(m.name)}:</span><button data-copy="${esc(m.one_liner)}">Copy</button></div>
           <code class="cmd">${esc(m.one_liner)}</code>
           <div class="muted" style="margin-top:6px;font-size:12.5px">First time: choose <b>m</b> in the menu to mount the share at login. Append <code>lmsc --apply</code> to skip the menu, or <code>lmsc --report</code> to only refresh this page.</div>
-          ${foreign.length ? `<div class="row"><span class="muted">Local models not in the library:</span></div><ul class="files">${foreign.map((f) => `<li><span>${esc(f.id)}</span><span>${hb(f.bytes)} · <a href="#" data-add-foreign="${esc(f.id)}">get from the Hub</a> · <a href="#" data-upload-cmd="${esc(m.name)}" data-upload-model="${esc(f.id)}">upload from ${esc(m.name)}</a></span></li>`).join("")}</ul>` : ""}
+          ${foreign.length ? `<div class="row"><span class="muted">Local quants not in the library:</span></div><ul class="files">${foreign.map((f) => `<li><span>${esc(f.id)}</span><span>${hb(f.bytes)} · <a href="#" data-add-foreign="${esc(f.id)}">get from the Hub</a> · <a href="#" data-upload-cmd="${esc(m.name)}" data-upload-model="${esc(f.id)}">upload from ${esc(m.name)}</a></span></li>`).join("")}</ul>` : ""}
         </div>`;
       }).join("");
     }
@@ -380,7 +385,7 @@
         det.querySelector("summary").textContent = `Edit ${m.name}`;
         form.editing.value = m.name; form.name.value = m.name;
         form.os.value = m.os; form.models_dir.value = m.models_dir; form.mount.value = m.mount;
-        form.smb_user.value = m.smb_user || ""; form.link_mode.value = m.link_mode || "dir";
+        form.smb_user.value = m.smb_user || "";
       }
     } else {
       det.querySelector("summary").textContent = "Add a machine";
@@ -393,7 +398,7 @@
     const f = ev.target;
     const body = {
       name: f.name.value.trim(), rename_from: f.editing.value || null, os: f.os.value, models_dir: f.models_dir.value.trim() || null, mount: f.mount.value.trim() || null,
-      smb_user: f.smb_user.value.trim() || null, link_mode: f.link_mode.value,
+      smb_user: f.smb_user.value.trim() || null,
     };
     try {
       await api("/api/machines", { method: "POST", body: JSON.stringify(body) });
@@ -467,13 +472,13 @@
     if (t.dataset.copy != null) { ev.preventDefault(); toast((await copyText(t.dataset.copy)) ? "Copied." : "Copy failed: select the command and copy it manually.", false); return; }
     if (t.closest(".seg") && t.dataset.state) { onSegClick(t); return; }
     if (t.dataset.modelDetail) { ev.preventDefault(); openModelDetail(t.dataset.modelDetail); return; }
-    if (t.dataset.delete) { deleteModel(t.dataset.delete); return; }
+    if (t.dataset.deleteVariant) { deleteVariant(t.dataset.deleteVariant); return; }
     if (t.dataset.openRepo) { ev.preventDefault(); openRepo(t.dataset.openRepo); return; }
     if (t.dataset.uploadCmd) {
       ev.preventDefault();
       const m = S.data.machines.find((x) => x.name === t.dataset.uploadCmd);
       const cmd = `${m.one_liner} lmsc --upload ${t.dataset.uploadModel}`;
-      openDrawer(`Upload ${esc(t.dataset.uploadModel)} from ${esc(m.name)}`, `<p>Run this in a terminal on <b>${esc(m.name)}</b>. It streams the model's files to the NAS with resume support and adds the folder to the library; the copy on ${esc(m.name)} then counts as <i>cached</i>.</p><code class="cmd">${esc(cmd)}</code><div class="row" style="margin-top:10px"><button class="primary" data-copy="${esc(cmd)}">Copy</button></div><p class="muted" style="margin-top:14px">Or run the plain one-liner: the interactive menu lists these models as <b>u1</b>, <b>u2</b>, and so on. Type that label to upload one, or press <b>u</b> to pick from the list.</p>`);
+      openDrawer(`Upload ${esc(t.dataset.uploadModel)} from ${esc(m.name)}`, `<p>Run this in a terminal on <b>${esc(m.name)}</b>. It streams this quant's files to the NAS with resume support and adds them to the library; the copy on ${esc(m.name)} then counts as <i>cached</i>.</p><code class="cmd">${esc(cmd)}</code><div class="row" style="margin-top:10px"><button class="primary" data-copy="${esc(cmd)}">Copy</button></div><p class="muted" style="margin-top:14px">Or run the plain one-liner: the interactive menu lists these models as <b>u1</b>, <b>u2</b>, and so on. Type that label to upload one, or press <b>u</b> to pick from the list.</p>`);
       return;
     }
     if (t.dataset.addForeign) { ev.preventDefault(); S.view = "search"; $("#search-q").value = t.dataset.addForeign; render(); openRepo(t.dataset.addForeign); return; }

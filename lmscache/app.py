@@ -15,7 +15,7 @@ from pydantic import BaseModel
 from . import catalog, config, db, hf, machines, uploads
 from .downloads import manager
 from .events import bus
-from .util import valid_repo_id
+from .util import valid_repo_id, valid_variant_id
 
 STATIC = Path(__file__).parent / "static"
 
@@ -101,6 +101,16 @@ def _model_id(publisher: str, repo: str) -> str:
     return mid
 
 
+def _variant_id(publisher: str, repo: str) -> str:
+    """publisher/repo@QUANT; must exist in the library."""
+    vid = f"{publisher}/{repo}"
+    if not valid_variant_id(vid):
+        raise HTTPException(400, "expected a variant id like publisher/repo@Q4_K_M")
+    if not catalog.variant(vid):
+        raise HTTPException(404, "no such variant in the library")
+    return vid
+
+
 def _machine(name: str) -> dict:
     m = machines.get(name)
     if not m:
@@ -117,12 +127,7 @@ def _state_payload(request: Request) -> dict:
     intents = machines.intents()
     reports = machines.reports()
     for m in machs:
-        rep = reports.get(m["name"])
-        m["report"] = (
-            {"at": rep["at"], "free_bytes": rep["free_bytes"], "total_bytes": rep["total_bytes"], "count": len(rep["models"])}
-            if rep
-            else None
-        )
+        m["report"] = machines.report_summary(reports.get(m["name"]))
         m["one_liner"] = machines.one_liner(m, base)
     return {
         "models": catalog.summary(),
@@ -212,22 +217,32 @@ async def rescan():
 
 
 @app.delete("/api/library/{publisher}/{repo}")
-async def delete_model(publisher: str, repo: str):
+async def delete_model(publisher: str, repo: str, variant: str | None = None):
     mid = _model_id(publisher, repo)
-    if not catalog.get(mid):
+    model = catalog.get(mid)
+    if not model:
         raise HTTPException(404, "not in library")
     for job in manager.list():
         if job["repo_id"] == mid and job["status"] in ("queued", "running", "finalizing"):
             raise HTTPException(409, "a download for this model is still active")
-    try:
-        await asyncio.to_thread(catalog.delete_model, mid)
-    except ValueError as exc:
-        raise HTTPException(400, str(exc))
-    for name, row in machines.intents().items():
-        if mid in row:
-            machines.clear_intent(name, mid)
+    if variant:
+        vid = f"{mid}@{variant}"
+        if not catalog.variant(vid):
+            raise HTTPException(404, "no such variant")
+        gone = [vid] if len(model["variants"]) > 1 else [v["id"] for v in model["variants"]]
+        try:
+            await asyncio.to_thread(catalog.delete_variant, vid)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+    else:
+        gone = [v["id"] for v in model["variants"]]
+        try:
+            await asyncio.to_thread(catalog.delete_model, mid)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+    machines.clear_intents_for(gone)
     bus.notify()
-    return {"deleted": mid}
+    return {"deleted": gone}
 
 
 # ----- hugging face -----
@@ -427,11 +442,9 @@ async def delete_machine(name: str):
 @app.put("/api/machines/{name}/models/{publisher}/{repo}")
 async def set_intent(name: str, publisher: str, repo: str, body: IntentIn):
     _machine(name)
-    mid = _model_id(publisher, repo)
-    if not catalog.get(mid):
-        raise HTTPException(404, "not in library")
+    vid = _variant_id(publisher, repo)
     try:
-        machines.set_intent(name, mid, body.state)
+        machines.set_intent(name, vid, body.state)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     bus.notify()
@@ -441,13 +454,14 @@ async def set_intent(name: str, publisher: str, repo: str, body: IntentIn):
 @app.delete("/api/machines/{name}/models/{publisher}/{repo}")
 async def clear_intent(name: str, publisher: str, repo: str):
     _machine(name)
-    machines.clear_intent(name, _model_id(publisher, repo))
+    machines.clear_intent(name, f"{publisher}/{repo}")
     bus.notify()
     return {"ok": True}
 
 
-@app.post("/api/machines/{name}/report")
+@app.post("/api/machines/{name}/report", response_class=PlainTextResponse)
 async def report(name: str, request: Request):
+    """The client script posts what the machine holds and gets back the plan it works from."""
     _machine(name)
     try:
         payload = await request.json()
@@ -455,13 +469,13 @@ async def report(name: str, request: Request):
         raise HTTPException(400, "body must be JSON")
     rep = machines.store_report(name, payload if isinstance(payload, dict) else {})
     bus.notify()
-    return {"ok": True, "models": len(rep["models"])}
+    return machines.plan_text(catalog.models(), name, rep)
 
 
 @app.get("/api/machines/{name}/plan", response_class=PlainTextResponse)
 async def plan(name: str):
     _machine(name)
-    return machines.plan_text(catalog.models(), name)
+    return machines.plan_text(catalog.models(), name, machines.reports().get(name))
 
 
 @app.get("/lmsc/{name}.sh", response_class=PlainTextResponse)

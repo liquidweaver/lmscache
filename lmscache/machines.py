@@ -1,4 +1,5 @@
-"""Machine profiles, per-machine intents and reports, and the shell that the UI hands out to copy."""
+"""Machine profiles, per-variant wanted states, machine reports, classification of what each machine holds,
+and the per-machine client script. A variant is one loadable quant of a repo: publisher/repo@Q4_K_M."""
 
 from __future__ import annotations
 
@@ -7,7 +8,8 @@ import time
 from urllib.parse import quote, urlsplit
 
 from . import config, db
-from .util import valid_repo_id
+from .catalog import detect_format
+from .util import is_mmproj, valid_repo_id, valid_variant_id, variants_for
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
 STATES = ("absent", "cached", "linked")
@@ -35,16 +37,12 @@ def upsert(data: dict) -> dict:
     if os_ not in OS_DEFAULTS:
         raise ValueError("os must be mac or linux")
     existing = get(name) or {}
-    link_mode = data.get("link_mode") or existing.get("link_mode") or "dir"
-    if link_mode not in ("dir", "files"):
-        raise ValueError("link_mode must be dir or files")
     profile = {
         "name": name,
         "os": os_,
         "models_dir": (data.get("models_dir") or existing.get("models_dir") or OS_DEFAULTS[os_]["models_dir"]).strip(),
         "mount": (data.get("mount") or existing.get("mount") or OS_DEFAULTS[os_]["mount"]).strip().rstrip("/"),
         "smb_user": (data.get("smb_user") or "").strip() or None,
-        "link_mode": link_mode,
         "created_at": existing.get("created_at") or time.time(),
     }
     for key in ("models_dir", "mount"):
@@ -78,38 +76,57 @@ def delete(name: str) -> None:
     db.execute("DELETE FROM reports WHERE machine = ?", (name,))
 
 
-# ----- intents and reports -----
-def set_intent(machine: str, model_id: str, state: str) -> None:
+# ----- wanted states (per variant) -----
+def set_intent(machine: str, vid: str, state: str) -> None:
     if state not in STATES:
         raise ValueError("state must be absent, cached or linked")
+    if not valid_variant_id(vid):
+        raise ValueError("bad variant id")
     db.execute(
         "INSERT OR REPLACE INTO intents (machine, model_id, state, set_at) VALUES (?, ?, ?, ?)",
-        (machine, model_id, state, time.time()),
+        (machine, vid, state, time.time()),
     )
 
 
-def clear_intent(machine: str, model_id: str) -> None:
-    db.execute("DELETE FROM intents WHERE machine = ? AND model_id = ?", (machine, model_id))
+def clear_intent(machine: str, vid: str) -> None:
+    db.execute("DELETE FROM intents WHERE machine = ? AND model_id = ?", (machine, vid))
+
+
+def clear_intents_for(vids: list[str]) -> None:
+    for vid in vids:
+        db.execute("DELETE FROM intents WHERE model_id = ?", (vid,))
 
 
 def intents() -> dict[str, dict[str, dict]]:
     out: dict[str, dict[str, dict]] = {}
-    for machine, model_id, state, set_at in db.query("SELECT machine, model_id, state, set_at FROM intents"):
-        out.setdefault(machine, {})[model_id] = {"state": state, "set_at": set_at}
+    for machine, vid, state, set_at in db.query("SELECT machine, model_id, state, set_at FROM intents"):
+        out.setdefault(machine, {})[vid] = {"state": state, "set_at": set_at}
     return out
 
 
+# ----- reports: what a machine actually holds -----
+def _clean_path(path: str) -> str | None:
+    parts = path.split("/")
+    if not path or "\t" in path or "\n" in path or any(p in ("", ".", "..") or p.startswith(".") for p in parts):
+        return None
+    return path
+
+
 def store_report(machine: str, payload: dict) -> dict:
-    models: dict[str, dict] = {}
+    models = []
     for entry in payload.get("models") or []:
         mid = str(entry.get("id") or "")
         if not valid_repo_id(mid):
             continue
-        state = entry.get("state")
-        if state not in ("cached", "linked"):
-            continue
-        models[mid] = {"state": state, "bytes": int(entry.get("bytes") or 0), "target": entry.get("target") or ""}
+        files = []
+        for f in entry.get("files") or []:
+            path = _clean_path(str(f.get("path") or ""))
+            if path is None:
+                continue
+            files.append({"path": path, "size": int(f.get("size") or 0), "link": bool(f.get("link"))})
+        models.append({"id": mid, "link": bool(entry.get("link")), "files": files})
     report = {
+        "v": 2,
         "at": time.time(),
         "free_bytes": int(payload.get("free_bytes") or 0),
         "total_bytes": int(payload.get("total_bytes") or 0),
@@ -123,47 +140,133 @@ def reports() -> dict[str, dict]:
     return db.all_json("reports", "machine", "data")
 
 
+def _valid(report: dict | None) -> bool:
+    return bool(report) and report.get("v") == 2
+
+
+def report_summary(report: dict | None) -> dict | None:
+    if not report:
+        return None
+    return {
+        "at": report["at"],
+        "free_bytes": report.get("free_bytes", 0),
+        "total_bytes": report.get("total_bytes", 0),
+        "count": sum(1 for m in report.get("models", []) if m.get("link") or m.get("files")),
+        "stale": not _valid(report),
+    }
+
+
+def _foreign_variants(rid: str, fmt: str, files: list[dict], model: dict | None) -> list[dict]:
+    """Local files that belong to no library variant, grouped into uploadable variants."""
+    _, repo_name = rid.split("/", 1)
+    variants, shared = variants_for(fmt, repo_name, files)
+    lib_shared = {f["path"] for f in (model or {}).get("shared") or []}
+    carry = [f for f in shared if is_mmproj(f["path"]) and f["path"] not in lib_shared] if fmt == "gguf" else []
+    out = []
+    for v in variants:
+        if v["size"] <= 0:
+            continue
+        vfiles = list(v["files"]) + carry
+        out.append({"id": f"{rid}@{v['key']}", "bytes": sum(f["size"] for f in vfiles), "files": [{"path": f["path"], "size": f["size"]} for f in vfiles]})
+    return out
+
+
+def classify(models: dict[str, dict], report: dict | None) -> tuple[dict[str, dict], list[dict]]:
+    """Per library variant: reported state and real bytes present; plus local variants the library lacks."""
+    states: dict[str, dict] = {}
+    foreign: list[dict] = []
+    valid = _valid(report)
+    rep_models = {m["id"]: m for m in report.get("models", [])} if valid else {}
+    for mid, model in models.items():
+        rm = rep_models.get(mid)
+        local = {f["path"]: f for f in rm.get("files", [])} if rm else {}
+        folder_link = bool(rm and rm.get("link"))
+        for v in model["variants"]:
+            n = len(v["files"])
+            real = link = 0
+            real_bytes = 0
+            for f in v["files"]:
+                lf = local.get(f["path"])
+                if folder_link or (lf and lf.get("link")):
+                    link += 1
+                elif lf and lf["size"] == f["size"]:
+                    real += 1
+                    real_bytes += f["size"]
+                elif lf:
+                    real_bytes += lf["size"]
+            if not valid:
+                state = None
+            elif n and real == n:
+                state = "cached"
+            elif n and link == n:
+                state = "linked"
+            elif real == 0 and link == 0 and real_bytes == 0:
+                state = "absent"
+            else:
+                state = "partial"
+            states[v["id"]] = {"reported": state, "bytes": real_bytes}
+        if rm and not folder_link and model["format"] == "gguf":
+            known = {f["path"] for v in model["variants"] for f in v["files"]} | {f["path"] for f in model.get("shared") or []}
+            extra = [f for f in rm["files"] if f["path"] not in known and not f.get("link")]
+            foreign += _foreign_variants(mid, "gguf", extra, model)
+    for rid, rm in rep_models.items():
+        if rid in models or rm.get("link"):
+            continue
+        files = [f for f in rm["files"] if not f.get("link")]
+        if not files:
+            continue
+        pub, repo = rid.split("/", 1)
+        fmt = detect_format(pub, repo, [f["path"] for f in files], [])
+        foreign += _foreign_variants(rid, fmt, files, None)
+    foreign.sort(key=lambda x: x["id"].lower())
+    return states, foreign
+
+
 def cells(models: dict[str, dict], machine_names: list[str], intents_map: dict, reports_map: dict) -> dict:
-    """Per machine, per model: what the last report says, what the user intends, and whether they disagree."""
     out: dict[str, dict[str, dict]] = {}
     for name in machine_names:
-        rep = reports_map.get(name)
-        my_intents = intents_map.get(name, {})
+        states, _ = classify(models, reports_map.get(name))
+        my = intents_map.get(name, {})
         row: dict[str, dict] = {}
-        for mid, model in models.items():
-            reported = None
-            nbytes = 0
-            if rep is not None:
-                entry = rep["models"].get(mid)
-                if entry is None:
-                    reported = "absent"
-                elif entry["state"] == "linked":
-                    reported = "linked"
-                else:
-                    nbytes = entry["bytes"]
-                    total = model.get("total_bytes") or 0
-                    reported = "partial" if total and nbytes < total * 0.98 else "cached"
-            intent = (my_intents.get(mid) or {}).get("state")
-            pending = bool(intent) and (reported is None or intent != reported)
-            if intent and reported == "partial" and intent == "cached":
-                pending = True
-            row[mid] = {"reported": reported, "bytes": nbytes, "intent": intent, "pending": pending}
+        for vid, st in states.items():
+            intent = (my.get(vid) or {}).get("state")
+            reported = st["reported"]
+            row[vid] = {"reported": reported, "bytes": st["bytes"], "intent": intent, "pending": bool(intent) and (reported is None or intent != reported)}
         out[name] = row
     return out
 
 
 def foreign(models: dict[str, dict], reports_map: dict) -> dict[str, list[dict]]:
-    """Models present on a machine that the library does not have."""
     out: dict[str, list[dict]] = {}
     for name, rep in reports_map.items():
-        extras = [
-            {"id": mid, **entry}
-            for mid, entry in rep["models"].items()
-            if mid not in models and not (entry["state"] == "cached" and entry["bytes"] == 0)
-        ]
+        _, extras = classify(models, rep)
         if extras:
-            out[name] = sorted(extras, key=lambda e: e["id"].lower())
+            out[name] = extras
     return out
+
+
+def plan_text(models: dict[str, dict], machine_name: str, report: dict | None) -> str:
+    """What the client script works from. Tab separated lines:
+    V variant bytes local wanted real_bytes | F variant path size | S repo path size | X foreign_variant bytes | XF foreign_variant path size"""
+    states, extras = classify(models, report)
+    wanted = intents().get(machine_name, {})
+    lines: list[str] = []
+    for m in sorted(models.values(), key=lambda m: m["id"].lower()):
+        for v in m["variants"]:
+            st = states.get(v["id"]) or {"reported": None, "bytes": 0}
+            want = (wanted.get(v["id"]) or {}).get("state") or "-"
+            lines.append("\t".join(["V", v["id"], str(v["bytes"]), st["reported"] or "-", want, str(st["bytes"])]))
+            for f in v["files"]:
+                if _clean_path(f["path"]):
+                    lines.append("\t".join(["F", v["id"], f["path"], str(f["size"])]))
+        for f in m.get("shared") or []:
+            if _clean_path(f["path"]):
+                lines.append("\t".join(["S", m["id"], f["path"], str(f["size"])]))
+    for x in extras:
+        lines.append("\t".join(["X", x["id"], str(x["bytes"])]))
+        for f in x["files"]:
+            lines.append("\t".join(["XF", x["id"], f["path"], str(f["size"])]))
+    return "\n".join(lines) + ("\n" if lines else "")
 
 
 # ----- client script -----
@@ -182,7 +285,6 @@ def smb_host(request, settings: dict) -> str:
 
 
 def _sh_path(path: str) -> str:
-    """Render a user path for use inside double quotes; ~ becomes $HOME."""
     if path.startswith("~"):
         path = "$HOME" + path[1:]
     return path.replace("\\", "\\\\").replace('"', '\\"').replace("`", "\\`")
@@ -190,17 +292,6 @@ def _sh_path(path: str) -> str:
 
 def one_liner(machine: dict, base: str) -> str:
     return f'bash -c "$(curl -fsSL {base}/lmsc/{machine["name"]}.sh)"'
-
-
-def plan_text(models: dict[str, dict], machine_name: str) -> str:
-    """Tab-separated: id, total bytes, format, wanted state ('-' when none). Parsed by the client script."""
-    wanted = intents().get(machine_name, {})
-    lines = []
-    for mid in sorted(models, key=str.lower):
-        m = models[mid]
-        want = (wanted.get(mid) or {}).get("state") or "-"
-        lines.append("\t".join([mid, str(m.get("total_bytes") or 0), m.get("format") or "other", want]))
-    return "\n".join(lines) + ("\n" if lines else "")
 
 
 def client_script(machine: dict, base: str, host: str, settings: dict) -> str:
@@ -221,7 +312,6 @@ def client_script(machine: dict, base: str, host: str, settings: dict) -> str:
         "SMB_USER_URL": quote(user, safe=""),
         "SMB_PASS": password.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "\\`"),
         "SMB_PASS_URL": quote(password, safe=""),
-        "LINK_MODE": machine.get("link_mode") or "dir",
     }
     script = _CLIENT_TEMPLATE
     for key, val in values.items():
@@ -232,14 +322,14 @@ def client_script(machine: dict, base: str, host: str, settings: dict) -> str:
 _CLIENT_TEMPLATE = r'''#!/usr/bin/env bash
 # LMS Cache client for "@@MACHINE@@". Fetched fresh from @@NAS@@ on every run; nothing is installed.
 # Run:  bash -c "$(curl -fsSL @@NAS@@/lmsc/@@MACHINE@@.sh)"
-# Flags (append after the closing quote):  lmsc --apply   apply wanted changes without the menu
-#                                          lmsc --report  only report local state
-#                                          lmsc --yes     with --apply: do not ask before deleting local copies
-#                                          lmsc --upload publisher/repo   upload a local model that the library lacks
+# Flags (append after the closing quote):  lmsc --apply               apply wanted changes without the menu
+#                                          lmsc --apply --yes         the same, without asking before deleting local copies
+#                                          lmsc --report              only report local state
+#                                          lmsc --upload repo@QUANT   upload a local quant that the library lacks
 NAS="@@NAS@@"; MACHINE="@@MACHINE@@"; OS="@@OS@@"
 MODELS_DIR="@@MODELS_DIR@@"; MOUNT="@@MOUNT@@"; LIB="$MOUNT/lmstudio"
 SMB_HOST="@@SMB_HOST@@"; SMB_SHARE="@@SMB_SHARE@@"; SMB_SHARE_URL="@@SMB_SHARE_URL@@"; SMB_SHARE_FSTAB="@@SMB_SHARE_FSTAB@@"
-SMB_USER="@@SMB_USER@@"; SMB_USER_URL="@@SMB_USER_URL@@"; SMB_PASS="@@SMB_PASS@@"; SMB_PASS_URL="@@SMB_PASS_URL@@"; LINK_MODE="@@LINK_MODE@@"
+SMB_USER="@@SMB_USER@@"; SMB_USER_URL="@@SMB_USER_URL@@"; SMB_PASS="@@SMB_PASS@@"; SMB_PASS_URL="@@SMB_PASS_URL@@"
 
 AUTO=0; REPORT_ONLY=0; YES=0; UPLOAD=""
 while [ $# -gt 0 ]; do
@@ -250,15 +340,16 @@ while [ $# -gt 0 ]; do
   shift
 done
 if [ -t 1 ]; then B=$'\033[1m'; D=$'\033[2m'; Y=$'\033[33m'; G=$'\033[32m'; R=$'\033[0m'; else B=""; D=""; Y=""; G=""; R=""; fi
+TAB=$'\t'
 
-N=0; PEND=0; NF=0
-IDS=(); SIZES=(); FMTS=(); WANT=(); LOCAL=(); LBYTES=(); FOREIGN=(); FBYTES=()
+# library variants (one loadable quant each) as parallel arrays, filled by sync_state
+N=0; NX=0; PEND=0
+VID=(); VBYTES=(); VLOCAL=(); VWANT=(); VREAL=(); VFILES=()
+XID=(); XBYTES=(); XFILES=(); SFILES=""
 
 hb() { awk -v b="${1:-0}" 'BEGIN{split("B KB MB GB TB",u," ");i=1;while(b>=1024&&i<5){b/=1024;i++}; if(i==1)printf "%d %s",b,u[i]; else printf "%.1f %s",b,u[i]}'; }
 esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
-urlencode() { local LC_ALL=C s="$1" i c out=""; for ((i=0;i<${#s};i++)); do c="${s:i:1}"; case "$c" in [a-zA-Z0-9./_-]) out="$out$c";; *) out="$out$(printf '%%%02X' "'$c")";; esac; done; printf '%s' "$out"; }
-dir_bytes() { ( cd "$1" 2>/dev/null && find . -type f ! -name '.*' ! -path '*/.*' -exec wc -c {} \; 2>/dev/null ) | awk '{s+=$1} END{printf "%.0f", s+0}'; }   # relative paths, so a dot in the parent path (like ~/.lmstudio) is not mistaken for a hidden file
-dir_bytes_all() { find "$1" -type f -exec wc -c {} \; 2>/dev/null | awk '{s+=$1} END{printf "%.0f", s+0}'; }   # includes rsync's temporary files, for progress
+urlencode() { local LC_ALL=C s="$1" i c out=""; for ((i=0;i<${#s};i++)); do c="${s:i:1}"; case "$c" in [a-zA-Z0-9./_@-]) out="$out$c";; *) out="$out$(printf '%%%02X' "'$c")";; esac; done; printf '%s' "$out"; }
 upload_have() { curl -fsS -m 10 "$NAS/api/upload/$1" 2>/dev/null | awk -F'\t' '{s+=$2} END{printf "%.0f", s+0}'; }
 fmt_time() {
   local s=${1:-0}
@@ -266,8 +357,7 @@ fmt_time() {
   elif [ "$s" -ge 60 ]; then printf '%dm %02ds' $((s/60)) $((s%60))
   else printf '%ds' "$s"; fi
 }
-# watch_progress <pid> <total bytes> <command that prints bytes done...>
-# One updating line (percent, bytes, speed, time left) until the process exits. Only when stdout is a terminal.
+# watch_progress <pid> <total bytes> <command that prints bytes done...>: one updating line while the process runs (terminal only)
 watch_progress() {
   local pid="$1" total="${2:-0}"; shift 2
   local done prev=-1 prev_t now dt inst rate=0 pct eta
@@ -290,18 +380,36 @@ watch_progress() {
   done
   printf '\r%90s\r' ''
 }
+# ----- safety: every destructive step is confined to the models folder -----
+valid_repo() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; }
+valid_rel() {  # relative file path from the plan: no empty, absolute, hidden or .. segments
+  case "$1" in ""|/*|..|../*|*/..|*/../*|*//*|.*|*/.*) return 1;; esac; return 0
+}
+safe_rm() {  # remove a file, symlink or folder, only strictly inside the models folder
+  local t="$1" root="${MODELS_DIR%/}"
+  [ -n "$root" ] && [ -n "$t" ] || { echo "refusing to remove: empty path" >&2; return 1; }
+  case "$root" in /?*) ;; *) echo "refusing to remove anything: models folder is '$root'" >&2; return 1;; esac
+  case "$t" in "$root"/?*) ;; *) echo "refusing to remove $t: outside $root" >&2; return 1;; esac
+  case "$t" in *"/../"*|*"/.."|*"//"*) echo "refusing to remove $t: suspicious path" >&2; return 1;; esac
+  if [ -L "$t" ] || [ -f "$t" ]; then rm -f "$t"; elif [ -d "$t" ]; then rm -rf "$t"; fi
+}
+list_bytes() {  # $1 = dir, $2 = file with relative paths -> bytes of those files present as real files
+  local d="$1" p s=0 n
+  while IFS= read -r p; do if [ -f "$d/$p" ] && [ ! -L "$d/$p" ]; then n=$(wc -c < "$d/$p" | tr -d ' '); s=$((s+n)); fi; done < "$2"
+  echo "$s"
+}
 
-smb_url() {  # URL form used by mount_smbfs on macOS
+# ----- share mount -----
+smb_url() {
   if [ "$SMB_USER" = guest ]; then printf '//guest@%s/%s' "$SMB_HOST" "$SMB_SHARE_URL"
   elif [ -n "$SMB_PASS_URL" ]; then printf '//%s:%s@%s/%s' "$SMB_USER_URL" "$SMB_PASS_URL" "$SMB_HOST" "$SMB_SHARE_URL"
   else printf '//%s@%s/%s' "$SMB_USER_URL" "$SMB_HOST" "$SMB_SHARE_URL"; fi
 }
-cifs_cred() {  # credential options for mount.cifs on Linux
+cifs_cred() {
   if [ "$SMB_USER" = guest ]; then printf 'guest'
   elif [ -n "$SMB_PASS" ]; then printf 'username=%s,password=%s' "$SMB_USER" "$SMB_PASS"
   else printf 'username=%s' "$SMB_USER"; fi
 }
-
 ensure_mount() {
   [ -d "$LIB" ] && return 0
   echo "Mounting //$SMB_HOST/$SMB_SHARE at $MOUNT as $SMB_USER ..."
@@ -316,128 +424,169 @@ ensure_mount() {
   [ -d "$LIB" ]
 }
 
-fetch_plan() {
-  local plan id size fmt want
-  plan=$(curl -fsS "$NAS/api/machines/$MACHINE/plan") || { echo "Cannot reach LMS Cache at $NAS" >&2; exit 1; }
-  N=0
-  while IFS=$'\t' read -r id size fmt want; do
-    [ -n "$id" ] || continue
-    [ "$want" = "-" ] && want=""
-    IDS[N]="$id"; SIZES[N]="${size:-0}"; FMTS[N]="$fmt"; WANT[N]="$want"; N=$((N+1))
-  done <<< "$plan"
-}
-
-local_state() {  # $1 = model id, $2 = expected bytes -> prints "state bytes"
-  local d="$MODELS_DIR/$1" st=absent by=0
-  if [ -L "$d" ]; then st=linked
-  elif [ -d "$d" ]; then
-    if [ -z "$(find "$d" -type f -print -quit 2>/dev/null)" ] && [ -n "$(find "$d" -type l -print -quit 2>/dev/null)" ]; then st=linked
-    else
-      by=$(find "$d" -type f -exec wc -c {} \; 2>/dev/null | awk '{s+=$1} END{printf "%.0f", s+0}')
-      if [ "$by" -eq 0 ]; then st=absent
-      elif [ "${2:-0}" -gt 0 ] && [ "$by" -lt $(( ${2:-0} * 98 / 100 )) ]; then st=partial; else st=cached; fi
-    fi
-  fi
-  printf '%s %s' "$st" "$by"
-}
-
-scan_local() {
-  local i out
-  for ((i=0;i<N;i++)); do
-    out=$(local_state "${IDS[i]}" "${SIZES[i]}")
-    LOCAL[i]="${out% *}"; LBYTES[i]="${out#* }"
-  done
-}
-
-is_pending() { local w="${WANT[$1]}" l="${LOCAL[$1]}"; [ -n "$w" ] && [ "$w" != "$l" ]; }
-
-list_foreign() {
-  local pub repo id found i size
-  NF=0; FOREIGN=(); FBYTES=()
-  [ -d "$MODELS_DIR" ] || return 0
-  for pub in "$MODELS_DIR"/*/; do
+# ----- scan local folders and exchange with the NAS -----
+scan_json() {  # every publisher/repo folder with its files (path, size, whether it is a symlink)
+  local pub repo p rel size link first=1 ffirst free total here
+  here=$(pwd)
+  cd "$MODELS_DIR" 2>/dev/null || { printf '{"models":[]}'; return; }
+  free=$(df -Pk . | awk 'NR==2{printf "%.0f", $4*1024}'); total=$(df -Pk . | awk 'NR==2{printf "%.0f", $2*1024}')
+  printf '{"free_bytes":%s,"total_bytes":%s,"models":[' "${free:-0}" "${total:-0}"
+  for pub in */; do
     pub=${pub%/}; [ -d "$pub" ] || continue
-    case "${pub##*/}" in .*) continue;; esac
+    case "$pub" in .*) continue;; esac
     for repo in "$pub"/*; do
       [ -e "$repo" ] || [ -L "$repo" ] || continue
-      case "${repo##*/}" in .*) continue;; esac
+      case "${repo#*/}" in .*) continue;; esac
       [ -d "$repo" ] || continue
-      id="${pub##*/}/${repo##*/}"
-      found=0; for ((i=0;i<N;i++)); do [ "${IDS[i]}" = "$id" ] && { found=1; break; }; done
-      if [ $found -eq 0 ]; then
-        size=$(dir_bytes "$repo")
-        [ "${size:-0}" -gt 0 ] || continue   # an empty folder is nothing to upload
-        FOREIGN[NF]="$id"; FBYTES[NF]="$size"; NF=$((NF+1))
-      fi
+      [ $first -eq 1 ] || printf ','; first=0
+      if [ -L "$repo" ]; then printf '{"id":"%s","link":true,"files":[]}' "$(esc "$repo")"; continue; fi
+      printf '{"id":"%s","link":false,"files":[' "$(esc "$repo")"
+      ffirst=1
+      while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        rel=${p#"$repo"/}
+        if [ -L "$p" ]; then link=true; size=0; else link=false; size=$(wc -c < "$p" | tr -d ' '); fi
+        [ $ffirst -eq 1 ] || printf ','; ffirst=0
+        printf '{"path":"%s","size":%s,"link":%s}' "$(esc "$rel")" "${size:-0}" "$link"
+      done <<< "$(find "$repo" \( -type f -o -type l \) ! -name '.*' ! -path '*/.*' 2>/dev/null | sort)"
+      printf ']}'
     done
   done
-  if [ $NF -gt 0 ]; then
-    printf '\n%sLocal models not in the library%s (type a label such as u1 to upload that model; the Search page can fetch them from the Hub instead):\n' "$D" "$R"
-    for ((i=0;i<NF;i++)); do printf '  u%-2d %-52.52s %10s\n' "$((i+1))" "${FOREIGN[i]}" "$(hb "${FBYTES[i]}")"; done
-  fi
+  printf ']}'
+  cd "$here"
+}
+
+sync_state() {  # report local state, receive the plan: library variants with local/wanted state, their files, foreign quants
+  local plan tag a b c d e cur=-1 xcur=-1 i
+  plan=$(scan_json | curl -fsS -X POST -H 'Content-Type: application/json' --data-binary @- "$NAS/api/machines/$MACHINE/report") || { echo "Cannot reach LMS Cache at $NAS" >&2; return 1; }
+  N=0; NX=0; VID=(); VBYTES=(); VLOCAL=(); VWANT=(); VREAL=(); VFILES=(); XID=(); XBYTES=(); XFILES=(); SFILES=""
+  while IFS="$TAB" read -r tag a b c d e; do
+    case "$tag" in
+      V) VID[N]="$a"; VBYTES[N]="${b:-0}"; VLOCAL[N]="$c"; VWANT[N]="$d"; VREAL[N]="${e:-0}"; VFILES[N]=""; cur=$N; N=$((N+1));;
+      F) [ $cur -ge 0 ] && VFILES[cur]="${VFILES[cur]}$b$TAB$c"$'\n';;
+      S) SFILES="$SFILES$a$TAB$b$TAB$c"$'\n';;
+      X) XID[NX]="$a"; XBYTES[NX]="${b:-0}"; XFILES[NX]=""; xcur=$NX; NX=$((NX+1));;
+      XF) [ $xcur -ge 0 ] && XFILES[xcur]="${XFILES[xcur]}$b$TAB$c"$'\n';;
+    esac
+  done <<< "$plan"
+  for ((i=0;i<N;i++)); do [ "${VWANT[i]}" = "-" ] && VWANT[i]=""; [ "${VLOCAL[i]}" = "-" ] && VLOCAL[i]="absent"; done
+  return 0
+}
+
+is_pending() { local w="${VWANT[$1]}" l="${VLOCAL[$1]}"; [ -n "$w" ] && [ "$w" != "$l" ]; }
+shared_for() { printf '%s' "$SFILES" | awk -F"$TAB" -v r="$1" '$1==r{print $2 "\t" $3}'; }
+repo_files() {  # all library files of a repo: every variant plus shared, as path<TAB>size lines
+  local i; for ((i=0;i<N;i++)); do [ "${VID[i]%@*}" = "$1" ] && printf '%s' "${VFILES[i]}"; done; shared_for "$1"
 }
 
 render() {
-  local i mark w l free c
+  local i mark w l c free repo quant
   free=$(df -Pk "$MODELS_DIR" 2>/dev/null | awk 'NR==2{printf "%.0f", $4*1024}')
   printf '\n%sLMS Cache%s · %s · library at %s · %s free locally\n\n' "$B" "$R" "$MACHINE" "$LIB" "$(hb "${free:-0}")"
-  printf '%s  %3s  %-52s %10s  %-8s %-8s%s\n' "$D" "#" "Model" "Size" "Local" "Wanted" "$R"
+  printf '%s  %3s  %-46s %-11s %10s  %-8s %-8s%s\n' "$D" "#" "Model" "Quant" "Size" "Local" "Wanted" "$R"
   PEND=0
   for ((i=0;i<N;i++)); do
-    w="${WANT[i]:--}"; l="${LOCAL[i]}"; mark=" "; c=""
+    repo="${VID[i]%@*}"; quant="${VID[i]##*@}"
+    w="${VWANT[i]:--}"; l="${VLOCAL[i]}"; mark=" "; c=""
     if is_pending "$i"; then mark="*"; c="$Y"; PEND=$((PEND+1)); fi
     [ "$l" = absent ] && l="-"
-    printf '%s%s %3d  %-52.52s %10s  %-8s %-8s%s\n' "$c" "$mark" "$((i+1))" "${IDS[i]}" "$(hb "${SIZES[i]}")" "$l" "$w" "$R"
+    printf '%s%s %3d  %-46.46s %-11.11s %10s  %-8s %-8s%s\n' "$c" "$mark" "$((i+1))" "$repo" "$quant" "$(hb "${VBYTES[i]}")" "$l" "$w" "$R"
   done
   [ "$N" -eq 0 ] && echo "  (the library is empty; download something from the Search page first)"
-  list_foreign
+  if [ $NX -gt 0 ]; then
+    printf '\n%sLocal quants not in the library%s (type a label such as u1 to upload one; the Search page can fetch them from the Hub instead):\n' "$D" "$R"
+    for ((i=0;i<NX;i++)); do printf '  u%-2d %-58.58s %10s\n' "$((i+1))" "${XID[i]}" "$(hb "${XBYTES[i]}")"; done
+  fi
 }
 
 set_intent() { curl -fsS -X PUT -H 'Content-Type: application/json' -d "{\"state\":\"$2\"}" "$NAS/api/machines/$MACHINE/models/$1" >/dev/null 2>&1 || true; }
 
-do_cache() {  # $1 = model id, $2 = expected bytes from the library plan
-  local id="$1" d="$MODELS_DIR/$1" total="${2:-0}" pid
-  ensure_mount || return 1
-  [ -L "$d" ] && rm "$d"
-  mkdir -p "$d" || return 1
-  [ "$total" -gt 0 ] || total=$(dir_bytes_all "$LIB/$id")
-  if command -v rsync >/dev/null; then rsync -a --partial "$LIB/$id/" "$d/" & pid=$!
-  else cp -R "$LIB/$id/." "$d/" & pid=$!; fi
-  watch_progress "$pid" "$total" dir_bytes_all "$d"
-  wait "$pid"
-}
-
-do_link() {
-  local id="$1" d="$MODELS_DIR/$1" f
-  ensure_mount || return 1
-  if [ -d "$d" ] && [ ! -L "$d" ]; then rm -rf "$d"; fi
-  if [ "$LINK_MODE" = files ]; then
-    mkdir -p "$d" || return 1
-    (cd "$LIB/$id" && find . -type f) | while IFS= read -r f; do
-      mkdir -p "$d/$(dirname "$f")" && ln -sfn "$LIB/$id/$f" "$d/$f"
-    done
-  else
-    mkdir -p "$(dirname "$d")" && ln -sfn "$LIB/$id" "$d"
+# ----- actions on one variant -----
+ensure_real_dir() {  # $1 = repo. A folder that is itself a symlink to the share becomes a real folder of per-file links.
+  local repo="$1" d="$MODELS_DIR/$1" path size
+  valid_repo "$repo" || { echo "bad repo id '$repo'" >&2; return 1; }
+  if [ -L "$d" ]; then
+    safe_rm "$d" && mkdir -p "$d" || return 1
+    while IFS="$TAB" read -r path size; do
+      valid_rel "$path" || continue
+      mkdir -p "$d/$(dirname "$path")" && ln -sfn "$LIB/$repo/$path" "$d/$path"
+    done <<< "$(repo_files "$repo")"
   fi
+  mkdir -p "$d"
 }
 
-do_remove() { local d="$MODELS_DIR/$1"; if [ -L "$d" ]; then rm "$d"; elif [ -d "$d" ]; then rm -rf "$d"; fi; }
+do_cache() {  # copy this variant's files (and missing shared files) from the share
+  local i="$1" vid="${VID[$1]}" repo d list path size total=0 pid rc
+  repo="${vid%@*}"; d="$MODELS_DIR/$repo"
+  valid_repo "$repo" || { echo "bad repo id '$repo'" >&2; return 1; }
+  ensure_mount || return 1
+  ensure_real_dir "$repo" || return 1
+  list=$(mktemp)
+  while IFS="$TAB" read -r path size; do
+    valid_rel "$path" || continue
+    [ -L "$d/$path" ] && safe_rm "$d/$path"
+    printf '%s\n' "$path" >> "$list"; total=$((total+size))
+  done <<< "${VFILES[i]}"
+  while IFS="$TAB" read -r path size; do
+    valid_rel "$path" || continue
+    if [ -L "$d/$path" ] || [ ! -e "$d/$path" ]; then [ -L "$d/$path" ] && safe_rm "$d/$path"; printf '%s\n' "$path" >> "$list"; total=$((total+size)); fi
+  done <<< "$(shared_for "$repo")"
+  if command -v rsync >/dev/null; then
+    rsync -a --inplace --partial --files-from="$list" "$LIB/$repo/" "$d/" & pid=$!
+  else
+    ( while IFS= read -r path; do mkdir -p "$d/$(dirname "$path")"; cp "$LIB/$repo/$path" "$d/$path"; done < "$list" ) & pid=$!
+  fi
+  watch_progress "$pid" "$total" list_bytes "$d" "$list"
+  wait "$pid"; rc=$?
+  rm -f "$list"; return $rc
+}
+
+do_link() {  # per-file symlinks into the share for this variant (and missing shared files)
+  local i="$1" vid="${VID[$1]}" repo d path size
+  repo="${vid%@*}"; d="$MODELS_DIR/$repo"
+  valid_repo "$repo" || { echo "bad repo id '$repo'" >&2; return 1; }
+  ensure_mount || return 1
+  ensure_real_dir "$repo" || return 1
+  while IFS="$TAB" read -r path size; do
+    valid_rel "$path" || continue
+    mkdir -p "$d/$(dirname "$path")" || return 1
+    [ -e "$d/$path" ] || [ -L "$d/$path" ] && { safe_rm "$d/$path" || return 1; }
+    ln -s "$LIB/$repo/$path" "$d/$path" || return 1
+  done <<< "${VFILES[i]}"
+  while IFS="$TAB" read -r path size; do
+    valid_rel "$path" || continue
+    [ -e "$d/$path" ] && continue
+    mkdir -p "$d/$(dirname "$path")" && ln -sfn "$LIB/$repo/$path" "$d/$path"
+  done <<< "$(shared_for "$repo")"
+}
+
+do_remove() {  # drop this variant's files; the folder goes too when only shared library files are left
+  local i="$1" vid="${VID[$1]}" repo d path size remaining
+  repo="${vid%@*}"; d="$MODELS_DIR/$repo"
+  valid_repo "$repo" || { echo "bad repo id '$repo'" >&2; return 1; }
+  if [ -L "$d" ]; then ensure_real_dir "$repo" || return 1; fi
+  [ -d "$d" ] || return 0
+  while IFS="$TAB" read -r path size; do valid_rel "$path" || continue; [ -e "$d/$path" ] || [ -L "$d/$path" ] && safe_rm "$d/$path"; done <<< "${VFILES[i]}"
+  remaining=$(cd "$d" && find . \( -type f -o -type l \) ! -name '.*' ! -path '*/.*' | sed 's#^\./##' | grep -v -x -F -f <(shared_for "$repo" | cut -f1) | head -1)
+  if [ -z "$remaining" ]; then safe_rm "$d"; else find "$d" -mindepth 1 -type d -empty -delete 2>/dev/null; fi
+  return 0
+}
 
 apply_one() {  # index, state
-  local i="$1" s="$2" id="${IDS[$1]}" rc=0
+  local i="$1" s="$2" vid="${VID[$1]}" rc=0
   case "$s" in
-    cached) printf '\n%sCaching %s (%s)%s\n' "$B" "$id" "$(hb "${SIZES[i]}")" "$R"; do_cache "$id" "${SIZES[i]}" || rc=1;;
-    linked) printf '\n%sLinking %s%s\n' "$B" "$id" "$R"; do_link "$id" || rc=1;;
-    absent) printf '\n%sRemoving %s%s\n' "$B" "$id" "$R"; do_remove "$id" || rc=1;;
+    cached) printf '\n%sCaching %s (%s)%s\n' "$B" "$vid" "$(hb "${VBYTES[i]}")" "$R"; do_cache "$i" || rc=1;;
+    linked) printf '\n%sLinking %s%s\n' "$B" "$vid" "$R"; do_link "$i" || rc=1;;
+    absent) printf '\n%sRemoving %s%s\n' "$B" "$vid" "$R"; do_remove "$i" || rc=1;;
   esac
-  if [ $rc -eq 0 ]; then printf '%sdone%s\n' "$G" "$R"; else printf '%sfailed: %s%s\n' "$Y" "$id" "$R" >&2; fi
+  if [ $rc -eq 0 ]; then printf '%sdone%s\n' "$G" "$R"; else printf '%sfailed: %s%s\n' "$Y" "$vid" "$R" >&2; fi
   return $rc
 }
 
 confirm_deletions() {  # args: indices; returns 1 if the user declines
   local i del=0 delbytes=0 ans
   for i in "$@"; do
-    case "${LOCAL[i]}" in cached|partial) case "${WANT[i]}" in linked|absent) del=$((del+1)); delbytes=$((delbytes+${LBYTES[i]}));; esac;; esac
+    case "${VWANT[i]}" in linked|absent) if [ "${VREAL[i]:-0}" -gt 0 ]; then del=$((del+1)); delbytes=$((delbytes+VREAL[i])); fi;; esac
   done
   [ $del -eq 0 ] && return 0
   [ $YES -eq 1 ] && return 0
@@ -451,8 +600,8 @@ apply_pending() {
   for ((i=0;i<N;i++)); do is_pending "$i" && todo[${#todo[@]}]="$i"; done
   if [ ${#todo[@]} -eq 0 ]; then echo "Nothing to do."; return 0; fi
   confirm_deletions "${todo[@]}" || return 1
-  for i in "${todo[@]}"; do apply_one "$i" "${WANT[i]}"; done
-  scan_local
+  for i in "${todo[@]}"; do apply_one "$i" "${VWANT[i]}"; done
+  sync_state
 }
 
 change_one() {
@@ -460,62 +609,72 @@ change_one() {
   case "$n" in ''|*[!0-9]*) echo "Not a row number."; return;; esac
   if [ "$n" -lt 1 ] || [ "$n" -gt "$N" ]; then echo "No such row."; return; fi
   i=$((n-1))
-  printf 'Set %s to  [1] not available  [2] cached locally  [3] linked  [Enter] cancel: ' "${IDS[i]}"
+  printf 'Set %s to  [1] not available  [2] cached locally  [3] linked  [Enter] cancel: ' "${VID[i]}"
   read -r s
   case "$s" in 1) s=absent;; 2) s=cached;; 3) s=linked;; *) return;; esac
-  WANT[i]="$s"; set_intent "${IDS[i]}" "$s"
+  VWANT[i]="$s"; set_intent "${VID[i]}" "$s"
   if is_pending "$i"; then
     confirm_deletions "$i" || return
-    apply_one "$i" "$s"; scan_local
+    apply_one "$i" "$s"; sync_state
   else
     echo "Already $s."
   fi
 }
 
-upload_model() {  # $1 = publisher/repo present locally but missing from the library
-  local id="$1" d="$MODELS_DIR/$1" files count total status f size have rc=0 json pid
-  case "$id" in */*) ;; *) echo "Give the model as publisher/repo."; return 1;; esac
-  [ -d "$d" ] || { echo "No local folder at $d"; return 1; }
-  files=$(cd "$d" && find . -type f ! -name '.*' ! -path '*/.*' | sed 's#^\./##' | sort)
-  [ -n "$files" ] || { echo "Nothing to upload in $d"; return 1; }
-  count=$(printf '%s\n' "$files" | wc -l | tr -d ' '); total=$(dir_bytes "$d")
-  printf '\n%sUploading %s%s: %s in %s file(s) to the library\n' "$B" "$id" "$R" "$(hb "$total")" "$count"
-  status=$(curl -fsS "$NAS/api/upload/$id") || { echo "LMS Cache refused the upload (is a download of this model running on the NAS?)" >&2; return 1; }
-  while IFS= read -r f; do
-    size=$(wc -c < "$d/$f" | tr -d ' ')
-    have=$(printf '%s\n' "$status" | awk -F'\t' -v p="$f" '$1==p{print $2}'); have=${have:-0}
+# ----- uploads of local quants the library lacks -----
+upload_variant() {  # $1 = index into the foreign list
+  local i="$1" xid="${XID[$1]}" repo d f size have rc=0 json pid total count status
+  repo="${xid%@*}"; d="$MODELS_DIR/$repo"
+  count=$(printf '%s' "${XFILES[i]}" | grep -c .); total="${XBYTES[i]}"
+  printf '\n%sUploading %s%s: %s in %s file(s) to the library\n' "$B" "$xid" "$R" "$(hb "$total")" "$count"
+  status=$(curl -fsS "$NAS/api/upload/$repo") || { echo "LMS Cache refused the upload (is a download of this model running on the NAS?)" >&2; return 1; }
+  while IFS="$TAB" read -r f size; do
+    [ -n "$f" ] || continue
+    have=$(printf '%s\n' "$status" | awk -F"$TAB" -v p="$f" '$1==p{print $2}'); have=${have:-0}
     if [ "$size" -gt 0 ] && [ "$have" -ge "$size" ]; then printf '  %s: already on the NAS\n' "$f"; continue; fi
     printf '  %s (%s)%s\n' "$f" "$(hb "$size")" "$([ "$have" -gt 0 ] && echo " resuming at $(hb "$have")")"
     if [ "$have" -gt 0 ]; then
-      curl -fsS -C "$have" -T "$d/$f" -H 'Content-Type: application/octet-stream' -o /dev/null "$NAS/api/upload/$id/$(urlencode "$f")" & pid=$!
+      curl -fsS -C "$have" -T "$d/$f" -H 'Content-Type: application/octet-stream' -o /dev/null "$NAS/api/upload/$repo/$(urlencode "$f")" & pid=$!
     else
-      curl -fsS -T "$d/$f" -H 'Content-Type: application/octet-stream' -o /dev/null "$NAS/api/upload/$id/$(urlencode "$f")" & pid=$!
+      curl -fsS -T "$d/$f" -H 'Content-Type: application/octet-stream' -o /dev/null "$NAS/api/upload/$repo/$(urlencode "$f")" & pid=$!
     fi
-    watch_progress "$pid" "$total" upload_have "$id"
+    watch_progress "$pid" "$total" upload_have "$repo"
     wait "$pid" || { rc=1; break; }
-  done <<< "$files"
+  done <<< "${XFILES[i]}"
   if [ $rc -ne 0 ]; then printf '%sUpload interrupted; run it again to resume.%s\n' "$Y" "$R" >&2; return 1; fi
   json=""
-  while IFS= read -r f; do json="$json{\"path\":\"$(esc "$f")\",\"size\":$(wc -c < "$d/$f" | tr -d ' ')},"; done <<< "$files"
+  while IFS="$TAB" read -r f size; do [ -n "$f" ] || continue; json="$json{\"path\":\"$(esc "$f")\",\"size\":$size},"; done <<< "${XFILES[i]}"
   json="{\"machine\":\"$MACHINE\",\"files\":[${json%,}]}"
-  if printf '%s' "$json" | curl -fsS -X POST -H 'Content-Type: application/json' --data-binary @- "$NAS/api/upload/$id/commit" >/dev/null; then
-    printf '%sAdded %s to the library.%s\n' "$G" "$id" "$R"
-    fetch_plan; scan_local
+  if printf '%s' "$json" | curl -fsS -X POST -H 'Content-Type: application/json' --data-binary @- "$NAS/api/upload/$repo/commit" >/dev/null; then
+    printf '%sAdded %s to the library.%s\n' "$G" "$xid" "$R"
+    sync_state
   else
     printf '%sThe NAS did not accept the upload; see the LMS Cache log.%s\n' "$Y" "$R" >&2; return 1
   fi
 }
 
-choose_upload() {
-  local n
-  if [ $NF -eq 0 ]; then echo "Every local model is already in the library."; return; fi
-  printf 'Upload which local model? [1-%d, Enter to cancel] ' "$NF"
-  read -r n
-  case "$n" in ''|*[!0-9]*) return;; esac
-  if [ "$n" -lt 1 ] || [ "$n" -gt "$NF" ]; then echo "No such entry."; return; fi
-  upload_model "${FOREIGN[$((n-1))]}"
+upload_by_id() {  # --upload repo@QUANT, or repo when it has exactly one local quant to offer
+  local want="$1" i hits=() 
+  for ((i=0;i<NX;i++)); do
+    if [ "${XID[i]}" = "$want" ] || [ "${XID[i]%@*}" = "$want" ]; then hits[${#hits[@]}]="$i"; fi
+  done
+  if [ ${#hits[@]} -eq 1 ]; then upload_variant "${hits[0]}"; return $?; fi
+  if [ ${#hits[@]} -eq 0 ]; then echo "No local quant named $want is missing from the library. Candidates:"; else echo "$want is ambiguous. Candidates:"; fi
+  for ((i=0;i<NX;i++)); do printf '  %s\n' "${XID[i]}"; done
+  return 1
 }
 
+choose_upload() {
+  local n
+  if [ $NX -eq 0 ]; then echo "Every local quant is already in the library."; return; fi
+  printf 'Upload which local quant? [1-%d, Enter to cancel] ' "$NX"
+  read -r n
+  case "$n" in ''|*[!0-9]*) return;; esac
+  if [ "$n" -lt 1 ] || [ "$n" -gt "$NX" ]; then echo "No such entry."; return; fi
+  upload_variant "$((n-1))"
+}
+
+# ----- login-time mount -----
 setup_mount() {
   if [ "$OS" = mac ]; then
     local flag="" plist="$HOME/Library/LaunchAgents/lmscache.mount.plist" url
@@ -561,78 +720,46 @@ PLIST
   if [ -d "$LIB" ]; then echo "Library is reachable at $LIB."; else printf '%sLibrary is not reachable yet; check the share permissions for %s.%s\n' "$Y" "$SMB_USER" "$R"; fi
 }
 
-report() {  # $1 = quiet -> no output on success
-  local pub repo state bytes target free total first json here quiet="${1:-}"
-  here=$(pwd)
-  cd "$MODELS_DIR" 2>/dev/null || { echo "models folder not found: $MODELS_DIR" >&2; return 1; }
-  free=$(df -Pk . | awk 'NR==2{printf "%.0f", $4*1024}'); total=$(df -Pk . | awk 'NR==2{printf "%.0f", $2*1024}')
-  json="{\"free_bytes\":${free:-0},\"total_bytes\":${total:-0},\"models\":["
-  first=1
-  for pub in */; do
-    pub=${pub%/}; [ -d "$pub" ] || continue
-    case "$pub" in .*) continue;; esac
-    for repo in "$pub"/*; do
-      [ -e "$repo" ] || [ -L "$repo" ] || continue
-      case "${repo#*/}" in .*) continue;; esac
-      if [ -L "$repo" ]; then state=linked; bytes=0; target=$(readlink "$repo")
-      elif [ -d "$repo" ]; then
-        target=""
-        if [ -z "$(find "$repo" -type f -print -quit 2>/dev/null)" ] && [ -n "$(find "$repo" -type l -print -quit 2>/dev/null)" ]; then state=linked; bytes=0
-        else state=cached; bytes=$(find "$repo" -type f -exec wc -c {} \; 2>/dev/null | awk '{s+=$1} END{printf "%.0f", s+0}'); fi
-        [ "$state" = cached ] && [ "${bytes:-0}" -eq 0 ] && continue   # empty folder: nothing to report
-      else continue; fi
-      [ $first -eq 1 ] || json="$json,"; first=0
-      json="$json{\"id\":\"$(esc "$repo")\",\"state\":\"$state\",\"bytes\":${bytes:-0},\"target\":\"$(esc "$target")\"}"
-    done
-  done
-  json="$json]}"
-  cd "$here"
-  if printf '%s' "$json" | curl -fsS -X POST -H 'Content-Type: application/json' --data-binary @- "$NAS/api/machines/$MACHINE/report" >/dev/null; then
-    [ -n "$quiet" ] || printf '%sReported %s state to LMS Cache.%s\n' "$G" "$MACHINE" "$R"
-  else
-    echo "Could not send the report to $NAS" >&2
-  fi
-}
+reported() { printf '%sReported %s state to LMS Cache.%s\n' "$G" "$MACHINE" "$R"; }
 
 main() {
   local choice n
+  case "$MODELS_DIR" in /?*) ;; *) echo "Refusing to run: the models folder is '$MODELS_DIR'. Fix this machine's profile in LMS Cache." >&2; exit 1;; esac
   if [ ! -d "$MODELS_DIR" ]; then
     echo "LM Studio models folder not found at $MODELS_DIR. Edit this machine in LMS Cache if the path is different." >&2
     exit 1
   fi
-  fetch_plan
-  if [ $REPORT_ONLY -eq 1 ]; then report; exit 0; fi
-  if [ -n "$UPLOAD" ]; then scan_local; list_foreign >/dev/null; upload_model "$UPLOAD"; report; exit $?; fi
+  if [ $REPORT_ONLY -eq 1 ]; then sync_state && reported; exit $?; fi
   ensure_mount || printf '%sThe library share is not mounted; caching and linking will fail until it is.%s\n' "$Y" "$R"
-  scan_local
-  report quiet
+  sync_state || exit 1
+  if [ -n "$UPLOAD" ]; then upload_by_id "$UPLOAD"; rc=$?; reported; exit $rc; fi
   if [ $AUTO -eq 1 ]; then
     render
     [ $PEND -gt 0 ] && apply_pending
-    report
+    reported
     exit 0
   fi
   while :; do
     render
     [ $PEND -gt 0 ] && printf '\n%s* %d wanted change(s) not applied yet.%s\n' "$Y" "$PEND" "$R"
     if [ "$N" -gt 0 ]; then
-      printf '\n[a] apply wanted changes   [1-%d] change one model   [u] upload a local model   [m] mount at login   [r] report only   [q] quit\n> ' "$N"
+      printf '\n[a] apply wanted changes   [1-%d] change one   [u] upload a local quant   [m] mount at login   [r] report only   [q] quit\n> ' "$N"
     else
-      printf '\n[u] upload a local model   [m] mount at login   [r] report only   [q] quit\n> '
+      printf '\n[u] upload a local quant   [m] mount at login   [r] report only   [q] quit\n> '
     fi
     read -r choice || break
     case "$choice" in
       a|A) apply_pending;;
       u|U) choose_upload;;
-      u[0-9]*|U[0-9]*) n=${choice#[uU]}; if [ "$n" -ge 1 ] 2>/dev/null && [ "$n" -le "$NF" ]; then upload_model "${FOREIGN[$((n-1))]}"; else echo "No such entry."; fi;;
+      u[0-9]*|U[0-9]*) n=${choice#[uU]}; if [ "$n" -ge 1 ] 2>/dev/null && [ "$n" -le "$NX" ]; then upload_variant "$((n-1))"; else echo "No such entry."; fi;;
       m|M) setup_mount;;
-      r|R) report;;
+      r|R) sync_state && reported;;
       q|Q) break;;
       "") ;;
       *) change_one "$choice";;
     esac
   done
-  report
+  sync_state && reported
 }
 
 main "$@"

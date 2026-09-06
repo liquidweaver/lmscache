@@ -30,9 +30,12 @@ The NAS holds the library; the machines hold only what they are using.
   and the NAS downloads it with `hf` and Xet acceleration. Gated repos work once you paste a token in Settings.
 - **Upload from a machine.** A model that already sits on one of your computers but not in the library can be
   pushed to the NAS from that computer, resumably, with a progress line.
-- **A models × machines matrix.** For every model and every machine, the UI shows what is there and lets you pick
-  what you want: **Not available**, **Cached locally** (a copy on that machine's disk) or **Linked** (a symlink into
-  the share, so the model loads straight off the NAS).
+- **Quants are the unit.** A library entry is one loadable quant, `publisher/repo@Q8_0`, the same idea as LM Studio's
+  own `@q8_0` variants. A GGUF repo can hold several; an MLX repo is one quant named in the repo.
+- **A quants × machines matrix.** For every quant and every machine, the UI shows what is there and lets you pick
+  what you want: **Not available**, **Cached locally** (a copy on that machine's disk) or **Linked** (per-file
+  symlinks into the share, so the files load straight off the NAS). One folder can hold a cached quant next to a
+  linked one.
 - **One command per machine, nothing installed.** The command fetches a script generated for that machine and runs
   it. The script mounts the share, applies the wanted states, and reports back. Every run uses the current version.
 - **No agents, no daemons.** The only long-running piece is the container on the NAS.
@@ -63,26 +66,30 @@ confined to the model folder, and an upload is refused while the NAS is download
 ### Machines, wanted state and reported state
 
 A machine is just a profile: a name, macOS or Linux, the LM Studio models folder, and where the share is mounted.
-Clicking a state in the matrix records what you **want** there. The script on that machine is what makes it true.
-Every run of the script ends by scanning the models folder and posting a **report**, so the matrix shows facts:
-a folder symlinked into the share is Linked, a folder with real files is Cached (or *partial* if smaller than the
-library entry), anything else is Not available. A wanted state that differs from the report shows as pending.
-Empty folders are ignored on both sides.
+Clicking a state in the matrix records what you **want** for a quant there. The script on that machine is what
+makes it true. Every run starts by scanning the models folder, file by file, and posting that **report**; the NAS
+classifies each library quant from its own files: all present as real files is Cached, all present as symlinks is
+Linked, some missing or short is *partial*, none is Not available. A wanted state that differs shows as pending.
+Files in a repo folder that belong to no library quant, say a Q4 you downloaded yourself next to the library's
+Q8, appear as a local quant you can upload. Empty folders are ignored.
 
 ### The client script
 
 `GET /lmsc/<machine>.sh` renders a bash script with the machine's paths, the share name and the read-only SMB
 account baked in. It
 
-1. reads the plan for this machine (`GET /api/machines/<name>/plan`: every library model, its size, the wanted state),
-2. mounts the share if needed (`mount_smbfs` on macOS, `mount -t cifs` on Linux),
-3. scans the local models folder and prints a table of Local versus Wanted, plus local models the library lacks,
-4. offers a menu: apply all wanted changes, change one model, upload a local model, install a login-time mount, report only,
+1. mounts the share if needed (`mount_smbfs` on macOS, `mount -t cifs` on Linux),
+2. scans the local models folder and posts it (`POST /api/machines/<name>/report`), receiving the plan: every library
+   quant with its files, local and wanted state, plus local quants the library lacks,
+3. prints a table of Local versus Wanted per quant,
+4. offers a menu: apply all wanted changes, change one quant, upload a local quant, install a login-time mount, report only,
 5. reports the resulting state back.
 
-Cached copies use rsync with resume. Linked replaces the folder with a symlink to the share, or with a folder of
-per-file symlinks if the machine is set to that mode. Removing a real local copy always asks first. Uploads and
-copies show one updating line with percent, bytes, speed and time left, measured from bytes that actually landed.
+Cached copies rsync exactly that quant's files (plus shared files such as a vision projector) in place, with resume.
+Linked creates per-file symlinks into the share; a folder that is itself a symlink is first turned into a folder of
+per-file links so quants stay independent. Removing real files always asks first, and every removal is confined to
+paths inside the models folder that the plan named. Uploads and copies show one updating line with percent, bytes,
+speed and time left, measured from bytes that actually landed.
 
 ### What is protected
 
@@ -113,10 +120,10 @@ copies show one updating line with percent, bytes, speed and time left, measured
 
 **Adding models**
 
-- Use Search. For GGUF repos pick one quant; the file picker pre-selects your preferred quant. For MLX repos take
-  the whole repository. Keep one quant per repository folder, because Cached copies the whole folder.
-- Models you already have on a machine show up in the script's "Local models not in the library" list and on that
-  machine's card. Type their label, such as `u2`, to upload them. The copy you already have then counts as Cached.
+- Use Search. For GGUF repos pick the quants you want; the file picker pre-selects your preferred quant, and each
+  becomes its own library entry. For MLX repos take the whole repository.
+- Quants you already have on a machine show up in the script's "Local quants not in the library" list and on that
+  machine's card. Type their label, such as `u2`, to upload one. The copy you already have then counts as Cached.
 
 **Keeping the matrix truthful**
 
@@ -131,13 +138,12 @@ copies show one updating line with percent, bytes, speed and time left, measured
 | `lmsc --apply` | apply wanted changes without the menu, still asking before deleting local copies |
 | `lmsc --apply --yes` | the same without asking |
 | `lmsc --report` | only refresh this machine's column in the web UI |
-| `lmsc --upload publisher/repo` | upload a local model the library lacks; rerun to resume |
+| `lmsc --upload publisher/repo@QUANT` | upload a local quant the library lacks; rerun to resume |
 
 **Troubleshooting**
 
 - *Mount fails or the library folder is empty*: check that the SMB account has read access to the share
   (`smbutil view //account@nas` on macOS lists what it can see) and that the share name in Settings matches.
-- *LM Studio does not list a Linked model*: switch that machine to per-file symlinks in its profile and relink.
 - *A model shows partial*: set Cached again; rsync resumes the copy.
 - *Upload interrupted*: run the same command again; it continues from what the NAS already has.
 - *Deploying says transfers are in progress*: an upload or download is running; wait, or `deploy.sh up --force`.
