@@ -329,6 +329,7 @@ def client_script(machine: dict, base: str, host: str, settings: dict) -> str:
 _CLIENT_TEMPLATE = r'''#!/usr/bin/env bash
 # LMS Cache client for "@@MACHINE@@". Fetched fresh from @@NAS@@ on every run; nothing is installed.
 # Run:  bash -c "$(curl -fsSL @@NAS@@/lmsc/@@MACHINE@@.sh)"
+# In the menu every action is staged; c commits them all and quits, d discards them and quits.
 # Flags (append after the closing quote):  lmsc --apply               apply wanted changes without the menu
 #                                          lmsc --apply --yes         the same, without asking before deleting local copies
 #                                          lmsc --report              only report local state
@@ -353,6 +354,10 @@ TAB=$'\t'
 N=0; NX=0; PEND=0
 VID=(); VBYTES=(); VLOCAL=(); VWANT=(); VREAL=(); VFILES=()
 XID=(); XBYTES=(); XFILES=(); SFILES=""
+# the interactive menu stages everything; nothing runs until "commit and quit"
+SN=0; SIDS=(); SSTATES=()      # staged state changes, by variant id
+UN=0; UIDS=()                  # staged uploads, by foreign variant id
+STAGE_MOUNT=0
 
 hb() { awk -v b="${1:-0}" 'BEGIN{split("B KB MB GB TB",u," ");i=1;while(b>=1024&&i<5){b/=1024;i++}; if(i==1)printf "%d %s",b,u[i]; else printf "%.1f %s",b,u[i]}'; }
 esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
@@ -493,7 +498,21 @@ sync_state() {  # report local state, receive the plan: library variants with lo
   return 0
 }
 
-is_pending() { local w="${VWANT[$1]}" l="${VLOCAL[$1]}"; [ -n "$w" ] && [ "$w" != "$l" ]; }
+vindex() { local i; for ((i=0;i<N;i++)); do [ "${VID[i]}" = "$1" ] && { echo "$i"; return; }; done; echo -1; }
+xindex() { local i; for ((i=0;i<NX;i++)); do [ "${XID[i]}" = "$1" ] && { echo "$i"; return; }; done; echo -1; }
+staged_for() { local i; for ((i=0;i<SN;i++)); do [ "${SIDS[i]}" = "$1" ] && { printf '%s' "${SSTATES[i]}"; return; }; done; }
+stage_state() {  # variant id, state
+  local i; for ((i=0;i<SN;i++)); do [ "${SIDS[i]}" = "$1" ] && { SSTATES[i]="$2"; return; }; done
+  SIDS[SN]="$1"; SSTATES[SN]="$2"; SN=$((SN+1))
+}
+unstage_state() {
+  local i j=0 ids=() sts=()
+  for ((i=0;i<SN;i++)); do [ "${SIDS[i]}" = "$1" ] && continue; ids[j]="${SIDS[i]}"; sts[j]="${SSTATES[i]}"; j=$((j+1)); done
+  SIDS=("${ids[@]}"); SSTATES=("${sts[@]}"); SN=$j
+}
+upload_staged() { local i; for ((i=0;i<UN;i++)); do [ "${UIDS[i]}" = "$1" ] && return 0; done; return 1; }
+effective_want() { local st; st=$(staged_for "${VID[$1]}"); if [ -n "$st" ]; then printf '%s' "$st"; else printf '%s' "${VWANT[$1]}"; fi; }
+is_pending() { local w l="${VLOCAL[$1]}"; w=$(effective_want "$1"); [ -n "$w" ] && [ "$w" != "$l" ]; }
 shared_for() { printf '%s' "$SFILES" | awk -F"$TAB" -v r="$1" '$1==r{print $2 "\t" $3}'; }
 repo_files() {  # all library files of a repo: every variant plus shared, as path<TAB>size lines
   local i; for ((i=0;i<N;i++)); do [ "${VID[i]%@*}" = "$1" ] && printf '%s' "${VFILES[i]}"; done; shared_for "$1"
@@ -507,16 +526,27 @@ render() {
   PEND=0
   for ((i=0;i<N;i++)); do
     repo="${VID[i]%@*}"; quant="${VID[i]##*@}"
-    w="${VWANT[i]:--}"; l="${VLOCAL[i]}"; mark=" "; c=""
-    if is_pending "$i"; then mark="*"; c="$Y"; PEND=$((PEND+1)); fi
+    w=$(effective_want "$i"); l="${VLOCAL[i]}"; mark=" "; c=""
+    if [ -n "$(staged_for "${VID[i]}")" ]; then mark=">"; c="$Y"
+    elif is_pending "$i"; then mark="*"; c="$Y"; PEND=$((PEND+1)); fi
     [ "$l" = absent ] && l="-"
-    printf '%s%s %3d  %-46.46s %-11.11s %10s  %-8s %-8s%s\n' "$c" "$mark" "$((i+1))" "$repo" "$quant" "$(hb "${VBYTES[i]}")" "$l" "$w" "$R"
+    printf '%s%s %3d  %-46.46s %-11.11s %10s  %-8s %-8s%s\n' "$c" "$mark" "$((i+1))" "$repo" "$quant" "$(hb "${VBYTES[i]}")" "$l" "${w:--}" "$R"
   done
   [ "$N" -eq 0 ] && echo "  (the library is empty; upload a model you want to keep with u<number>)"
   if [ $NX -gt 0 ]; then
-    printf '\n%sLocal quants not in the library%s (type a label such as u1 to upload one to the library):\n' "$D" "$R"
-    for ((i=0;i<NX;i++)); do printf '  u%-2d %-58.58s %10s\n' "$((i+1))" "${XID[i]}" "$(hb "${XBYTES[i]}")"; done
+    printf '\n%sLocal quants not in the library%s (type a label such as u1 to stage an upload; type it again to unstage):\n' "$D" "$R"
+    for ((i=0;i<NX;i++)); do printf '  u%-2d %-58.58s %10s%s\n' "$((i+1))" "${XID[i]}" "$(hb "${XBYTES[i]}")" "$(upload_staged "${XID[i]}" && printf '  %s> staged%s' "$Y" "$R")"; done
   fi
+}
+
+show_staged() {
+  local parts=""
+  [ $SN -gt 0 ] && parts="$SN state change(s)"
+  [ $UN -gt 0 ] && parts="${parts:+$parts, }$UN upload(s)"
+  [ $STAGE_MOUNT -eq 1 ] && parts="${parts:+$parts, }mount at login"
+  [ -n "$parts" ] && printf '\n%s> Staged, runs on commit: %s%s\n' "$Y" "$parts" "$R"
+  [ $PEND -gt 0 ] && printf '%s* %d change(s) wanted from the web UI, also applied on commit.%s\n' "$D" "$PEND" "$R"
+  return 0
 }
 
 set_intent() { curl -fsS -X PUT -H 'Content-Type: application/json' -d "{\"state\":\"$2\"}" "$NAS/api/machines/$MACHINE/models/$1" >/dev/null 2>&1 || true; }
@@ -632,13 +662,9 @@ change_one() {
   printf 'Set %s to  [1] not available  [2] cached locally  [3] linked  [Enter] cancel: ' "${VID[i]}"
   read -r s
   case "$s" in 1) s=absent;; 2) s=cached;; 3) s=linked;; *) return;; esac
-  VWANT[i]="$s"; set_intent "${VID[i]}" "$s"
-  if is_pending "$i"; then
-    confirm_deletions "$i" || return
-    apply_one "$i" "$s"; sync_state
-  else
-    echo "Already $s."
-  fi
+  if [ "$s" = "${VLOCAL[i]}" ] && [ -z "${VWANT[i]}" -o "${VWANT[i]}" = "$s" ]; then unstage_state "${VID[i]}"; echo "Already $s."; return; fi
+  stage_state "${VID[i]}" "$s"
+  printf 'Staged: %s -> %s (runs on commit).\n' "${VID[i]}" "$s"
 }
 
 # ----- uploads of local quants the library lacks -----
@@ -684,14 +710,50 @@ upload_by_id() {  # --upload repo@QUANT, or repo when it has exactly one local q
   return 1
 }
 
+toggle_upload() {  # $1 = 1-based foreign index: stage the upload, or unstage it if already staged
+  local n="$1" id i j=0 ids=()
+  if [ "$n" -lt 1 ] 2>/dev/null || [ "$n" -gt "$NX" ]; then echo "No such entry."; return; fi
+  id="${XID[$((n-1))]}"
+  if upload_staged "$id"; then
+    for ((i=0;i<UN;i++)); do [ "${UIDS[i]}" = "$id" ] && continue; ids[j]="${UIDS[i]}"; j=$((j+1)); done
+    UIDS=("${ids[@]}"); UN=$j; echo "Unstaged the upload of $id."
+  else
+    UIDS[UN]="$id"; UN=$((UN+1)); printf 'Staged: upload %s (runs on commit).\n' "$id"
+  fi
+}
+
 choose_upload() {
   local n
   if [ $NX -eq 0 ]; then echo "Every local quant is already in the library."; return; fi
-  printf 'Upload which local quant? [1-%d, Enter to cancel] ' "$NX"
+  printf 'Stage the upload of which local quant? [1-%d, Enter to cancel] ' "$NX"
   read -r n
   case "$n" in ''|*[!0-9]*) return;; esac
-  if [ "$n" -lt 1 ] || [ "$n" -gt "$NX" ]; then echo "No such entry."; return; fi
-  upload_variant "$((n-1))"
+  toggle_upload "$n"
+}
+
+commit_and_quit() {
+  local i idx
+  for ((i=0;i<UN;i++)); do
+    idx=$(xindex "${UIDS[i]}")
+    if [ "$idx" -ge 0 ]; then upload_variant "$idx" || printf '%sUpload of %s did not finish; run the script again to resume it.%s\n' "$Y" "${UIDS[i]}" "$R" >&2; fi
+  done
+  UN=0; UIDS=()
+  for ((i=0;i<SN;i++)); do
+    idx=$(vindex "${SIDS[i]}")
+    [ "$idx" -ge 0 ] || continue
+    set_intent "${SIDS[i]}" "${SSTATES[i]}"; VWANT[idx]="${SSTATES[i]}"
+  done
+  SN=0; SIDS=(); SSTATES=()
+  local todo=() 
+  for ((i=0;i<N;i++)); do is_pending "$i" && todo[${#todo[@]}]="$i"; done
+  if [ ${#todo[@]} -gt 0 ]; then apply_pending; else sync_state; fi
+  if [ $STAGE_MOUNT -eq 1 ]; then STAGE_MOUNT=0; setup_mount; fi
+  reported
+}
+
+discard_and_quit() {
+  SN=0; SIDS=(); SSTATES=(); UN=0; UIDS=(); STAGE_MOUNT=0
+  sync_state && reported
 }
 
 # ----- login-time mount -----
@@ -761,25 +823,25 @@ main() {
   fi
   while :; do
     render
-    [ $PEND -gt 0 ] && printf '\n%s* %d wanted change(s) not applied yet.%s\n' "$Y" "$PEND" "$R"
+    show_staged
     if [ "$N" -gt 0 ]; then
-      printf '\n[a] apply wanted changes   [1-%d] change one   [u] upload a local quant   [m] mount at login   [r] report only   [q] quit\n> ' "$N"
+      printf '\n[1-%d] change one   [u] upload a local quant   [m] mount at login%s   [r] refresh   [c] commit and quit   [d] discard and quit\n> ' "$N" "$([ $STAGE_MOUNT -eq 1 ] && printf ' (staged)')"
     else
-      printf '\n[u] upload a local quant   [m] mount at login   [r] report only   [q] quit\n> '
+      printf '\n[u] upload a local quant   [m] mount at login%s   [r] refresh   [c] commit and quit   [d] discard and quit\n> ' "$([ $STAGE_MOUNT -eq 1 ] && printf ' (staged)')"
     fi
-    read -r choice || break
+    read -r choice || { echo; discard_and_quit; break; }
     case "$choice" in
-      a|A) apply_pending;;
       u|U) choose_upload;;
-      u[0-9]*|U[0-9]*) n=${choice#[uU]}; if [ "$n" -ge 1 ] 2>/dev/null && [ "$n" -le "$NX" ]; then upload_variant "$((n-1))"; else echo "No such entry."; fi;;
-      m|M) setup_mount;;
+      u[0-9]*|U[0-9]*) toggle_upload "${choice#[uU]}";;
+      m|M) if [ $STAGE_MOUNT -eq 1 ]; then STAGE_MOUNT=0; echo "Unstaged: mount at login."; else STAGE_MOUNT=1; echo "Staged: mount at login (runs on commit)."; fi;;
       r|R) sync_state && reported;;
-      q|Q) break;;
+      c|C) commit_and_quit; break;;
+      d|D) discard_and_quit; break;;
+      q|Q) echo "Use c to commit and quit, or d to discard and quit.";;
       "") ;;
       *) change_one "$choice";;
     esac
   done
-  sync_state && reported
 }
 
 main "$@"

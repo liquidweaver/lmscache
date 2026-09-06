@@ -76,7 +76,10 @@ account baked in. It
 2. scans the local models folder and posts it (`POST /api/machines/<name>/report`), receiving the plan: every library
    quant with its files, local and wanted state, plus local quants the library lacks,
 3. prints a table of Local versus Wanted per quant,
-4. offers a menu: apply all wanted changes, change one quant, upload a local quant, install a login-time mount, report only,
+4. offers a menu where every action is staged: change one quant, stage an upload of a local quant, stage the
+   login-time mount, refresh. **c** commits the whole queue (uploads, then state changes, then the mount) and quits;
+   **d** discards it and quits. Wanted states set from the web UI are shown with `*` and also run on commit,
+   unless you override them in the session,
 5. reports the resulting state back.
 
 Cached copies rsync exactly that quant's files (plus shared files such as a vision projector) in place, with resume.
