@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LMS Cache</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Crect width=%2732%27 height=%2732%27 rx=%276%27 fill=%27%232f6feb%27/%3E%3Crect x=%278%27 y=%278%27 width=%2716%27 height=%2716%27 rx=%272%27 fill=%27white%27/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand"><span class="logo">▣</span> LMS Cache</div>
+  <nav id="nav">
+    <button data-view="library" class="active">Library</button>
+    <button data-view="search">Search</button>
+    <button data-view="downloads">Downloads <span id="dl-badge" class="badge" hidden></span></button>
+    <button data-view="machines">Machines</button>
+    <button data-view="settings">Settings</button>
+  </nav>
+  <div class="machine-pick">
+    <label for="machine-select">This machine</label>
+    <select id="machine-select"></select>
+  </div>
+</header>
+
+<main>
+  <section id="view-library" class="view">
+    <div id="runbar" class="runbar"></div>
+    <div class="toolbar">
+      <input id="lib-filter" type="search" placeholder="Filter the library…" autocomplete="off">
+      <div class="chips" id="lib-fmt">
+        <button data-fmt="any" class="on">All</button><button data-fmt="gguf">GGUF</button><button data-fmt="mlx">MLX</button><button data-fmt="safetensors">Safetensors</button>
+      </div>
+      <div class="spacer"></div>
+      <div class="muted" id="lib-summary"></div>
+    </div>
+    <div class="tablewrap"><table class="grid" id="lib-table"></table></div>
+  </section>
+
+  <section id="view-search" class="view" hidden>
+    <form class="toolbar" id="search-form">
+      <input id="search-q" type="search" placeholder="Search Hugging Face, or paste an owner/repo id…" autocomplete="off">
+      <div class="chips" id="search-fmt">
+        <button type="button" data-fmt="any" class="on">Any</button><button type="button" data-fmt="gguf">GGUF</button><button type="button" data-fmt="mlx">MLX</button><button type="button" data-fmt="safetensors">Safetensors</button>
+      </div>
+      <select id="search-sort">
+        <option value="downloads">Most downloaded</option>
+        <option value="trending">Trending</option>
+        <option value="likes">Most liked</option>
+        <option value="updated">Recently updated</option>
+      </select>
+      <button id="search-go" type="submit" class="primary">Search</button>
+    </form>
+    <div id="search-results" class="tablewrap"></div>
+  </section>
+
+  <section id="view-downloads" class="view" hidden>
+    <div class="toolbar">
+      <div class="muted" id="dl-summary"></div>
+      <div class="spacer"></div>
+      <button id="dl-clear">Clear finished</button>
+    </div>
+    <div id="dl-list" class="cards"></div>
+  </section>
+
+  <section id="view-machines" class="view" hidden>
+    <div id="machine-list" class="cards"></div>
+    <details class="card add-machine" id="add-machine">
+      <summary>Add a machine</summary>
+      <form id="machine-form" class="form">
+        <input type="hidden" name="editing" value="">
+        <label>Name <span class="hint">renaming keeps the machine's wanted states and last report</span><input name="name" required pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,31}" placeholder="studio"></label>
+        <label>OS <select name="os"><option value="mac">macOS</option><option value="linux">Linux</option></select></label>
+        <label>LM Studio models folder <input name="models_dir" placeholder="~/.lmstudio/models"></label>
+        <label>Mount point for the library share <input name="mount" placeholder="/Users/Shared/lmscache"></label>
+        <label>SMB account override <input name="smb_user" placeholder="use the global setting"></label>
+        <label>Link mode <select name="link_mode"><option value="dir">Folder symlink (default)</option><option value="files">Per-file symlinks</option></select></label>
+        <div class="row"><button type="submit" class="primary">Save machine</button><button type="button" id="machine-cancel">Cancel</button></div>
+      </form>
+    </details>
+  </section>
+
+  <section id="view-settings" class="view" hidden>
+    <form id="settings-form" class="card form">
+      <h3>Hugging Face</h3>
+      <label>Access token <span class="hint">needed for gated repos such as Llama or Gemma; stored in the config volume, never on the share</span>
+        <div class="row"><input name="hf_token" type="password" placeholder="hf_…" autocomplete="off"><button type="button" data-secret-toggle="hf_token">Show</button><button type="button" data-secret-clear="hf_token" hidden>Remove</button><span id="token-status" class="muted"></span></div>
+      </label>
+      <label>Preferred GGUF quant <span class="hint">pre-selected in the file picker</span><input name="preferred_quant" placeholder="Q4_K_M"></label>
+      <h3>Downloads</h3>
+      <label>Parallel downloads <input name="max_parallel" type="number" min="1" max="4"></label>
+      <label class="check"><input name="xet_high_performance" type="checkbox"> Xet high-performance mode (saturate the NAS internet link)</label>
+      <label class="check"><input name="verify_checksums" type="checkbox"> Verify SHA-256 after each download (slow on huge models)</label>
+      <h3>Network</h3>
+      <label>Public URL of this service <span class="hint">used in the one-liners; leave empty to use the address in your browser</span><input name="public_url" placeholder="http://nas.local:8080"></label>
+      <label>SMB host <span class="hint">leave empty to use this service's hostname</span><input name="smb_host" placeholder="nas.local"></label>
+      <label>SMB share name <input name="smb_share" placeholder="models"></label>
+      <label>SMB account <span class="hint">the read-only account machines mount the share with; "guest" for no credentials. A machine can override it.</span><input name="smb_user" placeholder="guest"></label>
+      <label>SMB password <span class="hint">embedded in the per-machine script so mounts run unattended; leave empty to keep the stored one</span>
+        <div class="row"><input name="smb_password" type="password" autocomplete="off"><button type="button" data-secret-toggle="smb_password">Show</button><button type="button" data-secret-clear="smb_password" hidden>Remove</button><span id="smb-status" class="muted"></span></div></label>
+      <div class="row"><button type="submit" class="primary">Save settings</button><span id="settings-status" class="muted"></span></div>
+    </form>
+    <div class="card">
+      <h3>Library</h3>
+      <div id="library-info" class="muted"></div>
+      <div class="row"><button id="rescan">Rescan folder</button></div>
+    </div>
+  </section>
+</main>
+
+<aside id="drawer" class="drawer" hidden>
+  <div class="drawer-head"><div id="drawer-title"></div><button id="drawer-close" title="Close">✕</button></div>
+  <div id="drawer-body" class="drawer-body"></div>
+</aside>
+<div id="toast" class="toast" hidden></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

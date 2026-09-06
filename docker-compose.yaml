@@ -1,0 +1,16 @@
+name: lmscache
+services:
+  lmscache:
+    build: .
+    image: lmscache:latest
+    container_name: lmscache
+    # UID:GID that owns the shared folder on the NAS. UGOS suggests PUID=1000 PGID=10 for the first admin user.
+    user: "${LMSCACHE_UID:-1000}:${LMSCACHE_GID:-10}"
+    ports:
+      - "${LMSCACHE_PORT:-8080}:8080"
+    volumes:
+      # The SMB-shared folder. The library lives in lmstudio/ inside it, transfer scratch in .incoming/.
+      - "${LMSCACHE_SHARE:-/volume1/models}:/models"
+      # Settings (Hugging Face token, SMB password), the catalog database and Hugging Face scratch. Keep this folder chmod 700.
+      - "${LMSCACHE_CONFIG:-/volume1/models/lmscache/config}:/config"
+    restart: unless-stopped

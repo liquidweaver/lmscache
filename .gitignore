@@ -1,0 +1,9 @@
+.venv/
+.dev/
+__pycache__/
+*.pyc
+*.egg-info/
+.DS_Store
+build/
+deploy.env
+.env

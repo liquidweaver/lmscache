@@ -1,0 +1,21 @@
+[project]
+name = "lmscache"
+version = "0.1.0"
+description = "LMS Cache: a Hugging Face model library for LM Studio, hosted on a NAS"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "huggingface_hub[hf_xet]>=1.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["lmscache"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+lmscache = ["static/*"]
