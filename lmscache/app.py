@@ -1,4 +1,4 @@
-"""FastAPI application: JSON API for the web UI, the per-machine client script, and static files."""
+"""FastAPI application: JSON API for the web UI, uploads from machines, the per-machine client script, static files."""
 
 from __future__ import annotations
 
@@ -12,8 +12,7 @@ from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import catalog, config, db, hf, machines, uploads
-from .downloads import manager
+from . import catalog, config, machines, uploads
 from .events import bus
 from .util import valid_repo_id, valid_variant_id
 
@@ -39,7 +38,6 @@ async def lifespan(_app: FastAPI):
     config.load()
     bus.bind(asyncio.get_running_loop())
     await asyncio.to_thread(catalog.scan)
-    await manager.start()
     task = asyncio.create_task(_periodic_rescan())
     yield
     task.cancel()
@@ -51,22 +49,11 @@ app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
 
 # ----- request bodies -----
 class SettingsIn(BaseModel):
-    hf_token: str | None = None
-    preferred_quant: str | None = None
-    max_parallel: int | None = None
-    xet_high_performance: bool | None = None
-    verify_checksums: bool | None = None
     public_url: str | None = None
     smb_host: str | None = None
     smb_share: str | None = None
     smb_user: str | None = None
     smb_password: str | None = None
-
-
-class DownloadIn(BaseModel):
-    repo_id: str
-    files: list[str] = []
-    whole_repo: bool = False
 
 
 class MachineIn(BaseModel):
@@ -76,7 +63,6 @@ class MachineIn(BaseModel):
     models_dir: str | None = None
     mount: str | None = None
     smb_user: str | None = None
-    link_mode: str | None = None
 
 
 class IntentIn(BaseModel):
@@ -134,7 +120,6 @@ def _state_payload(request: Request) -> dict:
         "machines": machs,
         "cells": machines.cells(models, names, intents, reports),
         "foreign": machines.foreign(models, reports),
-        "jobs": manager.list(),
         "settings": config.public(settings),
         "disk": catalog.disk(),
         "library_dir": str(config.LIBRARY_DIR),
@@ -144,7 +129,7 @@ def _state_payload(request: Request) -> dict:
     }
 
 
-# ----- pages -----
+# ----- pages and live state -----
 @app.get("/", include_in_schema=False)
 async def index():
     return FileResponse(STATIC / "index.html")
@@ -186,8 +171,8 @@ async def get_settings():
 
 @app.get("/api/settings/reveal/{key}")
 async def reveal_setting(key: str):
-    """Return a stored secret for display in the UI. The UI is unauthenticated, so this is LAN-only by design."""
-    if key not in ("hf_token", "smb_password"):
+    """Return the stored SMB password for display in the UI. The UI is unauthenticated: LAN only by design."""
+    if key != "smb_password":
         raise HTTPException(404, "unknown setting")
     return {"key": key, "value": config.load().get(key) or ""}
 
@@ -222,9 +207,6 @@ async def delete_model(publisher: str, repo: str, variant: str | None = None):
     model = catalog.get(mid)
     if not model:
         raise HTTPException(404, "not in library")
-    for job in manager.list():
-        if job["repo_id"] == mid and job["status"] in ("queued", "running", "finalizing"):
-            raise HTTPException(409, "a download for this model is still active")
     if variant:
         vid = f"{mid}@{variant}"
         if not catalog.variant(vid):
@@ -245,124 +227,10 @@ async def delete_model(publisher: str, repo: str, variant: str | None = None):
     return {"deleted": gone}
 
 
-# ----- hugging face -----
-@app.get("/api/search")
-async def search(q: str = "", format: str = "any", sort: str = "downloads", limit: int = 30):
-    token = config.load().get("hf_token") or None
-    try:
-        results = await hf.search(q.strip(), format, sort, max(1, min(100, limit)), token)
-    except Exception as exc:
-        raise HTTPException(502, f"Hugging Face search failed: {exc}")
-    have = catalog.models()
-    for r in results:
-        r["in_library"] = r["id"] in have
-    return {"results": results}
-
-
-@app.get("/api/repo/{publisher}/{repo}")
-async def repo(publisher: str, repo: str):
-    mid = _model_id(publisher, repo)
-    token = config.load().get("hf_token") or None
-    try:
-        info = await hf.repo_info(mid, token)
-    except Exception as exc:
-        raise HTTPException(502, f"Hugging Face lookup failed: {exc}")
-    existing = catalog.get(mid)
-    info["in_library"] = bool(existing)
-    info["library_files"] = [f["path"] for f in existing["files"]] if existing else []
-    info["preferred_quant"] = config.load().get("preferred_quant") or ""
-    return info
-
-
-# ----- downloads -----
-@app.get("/api/downloads")
-async def downloads():
-    return {"jobs": manager.list()}
-
-
-@app.post("/api/downloads")
-async def add_download(body: DownloadIn):
-    if not valid_repo_id(body.repo_id):
-        raise HTTPException(400, "invalid repo id")
-    token = config.load().get("hf_token") or None
-    try:
-        info = await hf.repo_info(body.repo_id, token)
-    except Exception as exc:
-        raise HTTPException(502, f"Hugging Face lookup failed: {exc}")
-    if body.whole_repo:
-        selected = info["files"]
-    else:
-        wanted = set(body.files)
-        selected = [f for f in info["files"] if f["path"] in wanted]
-    if not selected:
-        raise HTTPException(400, "no files selected")
-    hf_meta = {k: info.get(k) for k in ("downloads", "likes", "tags", "pipeline_tag", "gated", "params", "updated")}
-    try:
-        job = manager.add(body.repo_id, info.get("revision"), selected, body.whole_repo, info["format"], hf_meta)
-    except ValueError as exc:
-        raise HTTPException(409, str(exc))
-    return job
-
-
-@app.post("/api/downloads/clear")
-async def clear_downloads():
-    manager.clear_finished()
-    return {"ok": True}
-
-
-@app.post("/api/downloads/{jid}/cancel")
-async def cancel_download(jid: str):
-    try:
-        return manager.cancel(jid)
-    except KeyError:
-        raise HTTPException(404, "no such job")
-
-
-@app.post("/api/downloads/{jid}/retry")
-async def retry_download(jid: str):
-    try:
-        return manager.retry(jid)
-    except KeyError:
-        raise HTTPException(404, "no such job")
-
-
-@app.delete("/api/downloads/{jid}")
-async def remove_download(jid: str):
-    try:
-        manager.remove(jid)
-    except KeyError:
-        raise HTTPException(404, "no such job")
-    except ValueError as exc:
-        raise HTTPException(409, str(exc))
-    return {"ok": True}
-
-
 # ----- uploads from machines -----
-def _upload_allowed(mid: str) -> None:
-    for job in manager.list():
-        if job["repo_id"] == mid and job["status"] in ("queued", "running", "finalizing"):
-            raise HTTPException(409, "a download for this model is running on the NAS")
-
-
-async def _enrich_from_hub(mid: str) -> None:
-    """Best effort: attach Hub metadata to an uploaded model so the UI can show downloads, tags and gating."""
-    try:
-        info = await hf.repo_info(mid, config.load().get("hf_token") or None)
-    except Exception:
-        return
-    meta = db.get_json("models", "id", mid)
-    if meta is None or not catalog.get(mid):
-        return
-    meta["hf"] = {k: info.get(k) for k in ("downloads", "likes", "tags", "pipeline_tag", "gated", "params", "updated")}
-    catalog.remember(mid, meta)
-    await asyncio.to_thread(catalog.scan)
-    bus.notify()
-
-
 @app.get("/api/upload/{publisher}/{repo}", response_class=PlainTextResponse)
 async def upload_status(publisher: str, repo: str):
     mid = _model_id(publisher, repo)
-    _upload_allowed(mid)
     lines = [f"{path}\t{size}" for path, size in sorted(uploads.status(mid).items())]
     return "\n".join(lines) + ("\n" if lines else "")
 
@@ -370,7 +238,6 @@ async def upload_status(publisher: str, repo: str):
 @app.put("/api/upload/{publisher}/{repo}/{path:path}")
 async def upload_file(publisher: str, repo: str, path: str, request: Request):
     mid = _model_id(publisher, repo)
-    _upload_allowed(mid)
     try:
         rel = uploads.safe_rel_path(path)
         start = uploads.parse_range(request.headers.get("content-range"))
@@ -388,19 +255,16 @@ async def upload_file(publisher: str, repo: str, path: str, request: Request):
 @app.post("/api/upload/{publisher}/{repo}/commit")
 async def upload_commit(publisher: str, repo: str, body: CommitIn):
     mid = _model_id(publisher, repo)
-    _upload_allowed(mid)
     try:
         model = await asyncio.to_thread(uploads.commit, mid, [f.model_dump() for f in body.files], body.machine)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
-    asyncio.create_task(_enrich_from_hub(mid))
     return model
 
 
 @app.delete("/api/upload/{publisher}/{repo}")
 async def upload_abort(publisher: str, repo: str):
     mid = _model_id(publisher, repo)
-    _upload_allowed(mid)
     await asyncio.to_thread(uploads.abort, mid)
     return {"ok": True}
 

@@ -512,9 +512,9 @@ render() {
     [ "$l" = absent ] && l="-"
     printf '%s%s %3d  %-46.46s %-11.11s %10s  %-8s %-8s%s\n' "$c" "$mark" "$((i+1))" "$repo" "$quant" "$(hb "${VBYTES[i]}")" "$l" "$w" "$R"
   done
-  [ "$N" -eq 0 ] && echo "  (the library is empty; download something from the Search page first)"
+  [ "$N" -eq 0 ] && echo "  (the library is empty; upload a model you want to keep with u<number>)"
   if [ $NX -gt 0 ]; then
-    printf '\n%sLocal quants not in the library%s (type a label such as u1 to upload one; the Search page can fetch them from the Hub instead):\n' "$D" "$R"
+    printf '\n%sLocal quants not in the library%s (type a label such as u1 to upload one to the library):\n' "$D" "$R"
     for ((i=0;i<NX;i++)); do printf '  u%-2d %-58.58s %10s\n' "$((i+1))" "${XID[i]}" "$(hb "${XBYTES[i]}")"; done
   fi
 }

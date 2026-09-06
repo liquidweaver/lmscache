@@ -1,3 +1,3 @@
-"""LMS Cache: download Hugging Face models once, into LM Studio's folder layout, on a NAS."""
+"""LMS Cache: one shared LM Studio model library on a NAS, fed by the machines that use it."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

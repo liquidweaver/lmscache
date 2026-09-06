@@ -11,7 +11,6 @@ from . import config
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS models   (id TEXT PRIMARY KEY, meta TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS jobs     (id TEXT PRIMARY KEY, data TEXT NOT NULL, created_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS machines (name TEXT PRIMARY KEY, data TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS intents  (machine TEXT NOT NULL, model_id TEXT NOT NULL, state TEXT NOT NULL,
                                      set_at REAL NOT NULL, PRIMARY KEY (machine, model_id));

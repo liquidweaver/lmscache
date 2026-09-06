@@ -12,7 +12,6 @@ from pathlib import Path
 from . import catalog, config, db
 from .events import bus
 
-_active: dict[str, float] = {}  # repo_id -> last activity
 _RANGE = re.compile(r"^bytes\s+(\d+)-(\d+)?/(\d+|\*)$")
 BUFFER = 8 * 1024 * 1024
 
@@ -25,18 +24,6 @@ class OffsetMismatch(Exception):
 
 class NoSpace(Exception):
     pass
-
-
-def touch(repo_id: str) -> None:
-    _active[repo_id] = time.time()
-
-
-def is_active(repo_id: str, within: float = 600) -> bool:
-    return time.time() - _active.get(repo_id, 0) < within
-
-
-def finish(repo_id: str) -> None:
-    _active.pop(repo_id, None)
 
 
 def safe_rel_path(path: str) -> str:
@@ -87,7 +74,6 @@ async def receive(repo_id: str, rel: str, request, start: int) -> int:
     free = shutil.disk_usage(config.MODELS_ROOT).free
     if length and length > free - 2 * 1024**3:
         raise NoSpace()
-    touch(repo_id)
     buf = bytearray()
     with open(target, "ab" if start else "wb") as fh:
         async for chunk in request.stream():
@@ -97,10 +83,8 @@ async def receive(repo_id: str, rel: str, request, start: int) -> int:
             if len(buf) >= BUFFER:
                 data, buf = bytes(buf), bytearray()
                 await asyncio.to_thread(fh.write, data)
-                touch(repo_id)
         if buf:
             await asyncio.to_thread(fh.write, bytes(buf))
-    touch(repo_id)
     return target.stat().st_size
 
 
@@ -129,7 +113,6 @@ def commit(repo_id: str, files: list[dict], machine: str | None) -> dict | None:
     meta = db.get_json("models", "id", repo_id) or {}
     meta.update({"added_at": meta.get("added_at") or time.time(), "source": {"kind": "upload", "machine": machine, "at": time.time()}})
     catalog.remember(repo_id, meta)
-    finish(repo_id)
     catalog.scan()
     bus.notify()
     return catalog.get(repo_id)
@@ -137,7 +120,6 @@ def commit(repo_id: str, files: list[dict], machine: str | None) -> dict | None:
 
 def abort(repo_id: str) -> None:
     shutil.rmtree(scratch_dir(repo_id), ignore_errors=True)
-    finish(repo_id)
     try:
         (config.INCOMING_DIR / repo_id.split("/")[0]).rmdir()
     except OSError:

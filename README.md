@@ -1,16 +1,17 @@
 # LMS Cache
 
-Download open-weight models **once** onto a NAS, in the exact folder layout [LM Studio](https://lmstudio.ai) uses, and
-give every Mac or Linux machine on the LAN a single command that copies, links or removes those models locally.
-The NAS holds the library; the machines hold only what they are using.
+Keep the open-weight models you want to keep **once**, on a NAS, in the exact folder layout [LM Studio](https://lmstudio.ai)
+uses, and give every Mac or Linux machine on the LAN a single command that uploads keepers to the library and copies,
+links or removes library quants locally. Try models in LM Studio as usual; promote the good ones to the library from
+the machine that has them; the NAS holds the library and the machines hold only what they are using.
 
 ```
                        NAS (any Docker host with an SMB share; developed on a UGREEN NAS running UGOS Pro)
-  Hugging Face ──▶  ┌────────────────────────────────────────────────────────────────┐
+                    ┌────────────────────────────────────────────────────────────────┐
                     │  lmscache container (:8080)          /volume1/models             │
-                    │   web UI: search, queue, library,     lmstudio/<publisher>/<repo>/…  ◀── SMB share, read-only
-                    │   machines, settings                  .incoming/  (transfers land here first)
-                    │   resumable uploads from machines     lmscache/config/ (token, database; mode 700)
+                    │   web UI: library, machines,          lmstudio/<publisher>/<repo>/…  ◀── SMB share, read-only
+                    │   settings                            .incoming/  (uploads land here first)
+                    │   resumable uploads from machines     lmscache/config/ (settings, database; mode 700)
                     └────────────────────────────────────────────────────────────────┘
                                           ▲                          ▲
      any browser ─── http://nas:8080 ─────┘                          │ SMB
@@ -26,10 +27,9 @@ The NAS holds the library; the machines hold only what they are using.
 - **One library, LM Studio's layout.** Models live at `lmstudio/<publisher>/<repo>/…` on the share, the same
   `publisher/repo` structure LM Studio keeps under `~/.lmstudio/models`, so a folder from the library drops straight
   into LM Studio with no conversion. GGUF and MLX both work.
-- **Download from Hugging Face on the NAS.** Search the Hub from the web UI, pick a quant or the whole repository,
-  and the NAS downloads it with `hf` and Xet acceleration. Gated repos work once you paste a token in Settings.
-- **Upload from a machine.** A model that already sits on one of your computers but not in the library can be
-  pushed to the NAS from that computer, resumably, with a progress line.
+- **Fed by the machines.** Download and try models in LM Studio as you always have. A quant that sits on one of your
+  computers but not in the library shows up in that machine's script as `u1`, `u2`, and so on; one keystroke pushes it
+  to the NAS, resumably, with a progress line. Nothing on the NAS talks to Hugging Face.
 - **Quants are the unit.** A library entry is one loadable quant, `publisher/repo@Q8_0`, the same idea as LM Studio's
   own `@q8_0` variants. A GGUF repo can hold several; an MLX repo is one quant named in the repo.
 - **A quants × machines matrix.** For every quant and every machine, the UI shows what is there and lets you pick
@@ -45,23 +45,17 @@ The NAS holds the library; the machines hold only what they are using.
 ### The library is the folder tree
 
 The catalog is derived from the folders under `lmstudio/`. Anything you copy in by hand appears after a rescan.
-A SQLite database in the config volume only adds what the folder cannot tell: which Hub revision a download came
-from, per-file checksums, Hub metadata, and which machine uploaded a model.
-
-### Downloads
-
-A job downloads into `.incoming/<publisher>/<repo>` on the same filesystem, verifies every file's size (and
-optionally SHA-256), strips the CLI's cache folder, and then renames the folder into `lmstudio/`. The rename is
-atomic, so machines and the catalog never see a half-finished model. Progress comes from the bytes on disk.
+A SQLite database in the config volume only adds what the folder cannot tell: when a model arrived and which machine
+uploaded it, plus each machine's profile, wanted states and last report.
 
 ### Uploads
 
 The client streams each file with `curl -T` to `PUT /api/upload/<publisher>/<repo>/<path>`. The server writes into
 `.incoming/`, and `GET /api/upload/<publisher>/<repo>` tells the client how many bytes of each file it already has,
 so an interrupted upload resumes with a `Content-Range` from that offset. When every file is complete the client
-sends a manifest of paths and sizes; the server checks them, moves the folder into the library atomically, records
-which machine it came from, and fetches Hub metadata for the repo in the background. Dotfiles are skipped, paths are
-confined to the model folder, and an upload is refused while the NAS is downloading the same model.
+sends a manifest of paths and sizes; the server checks them, moves the files into the library atomically (a new repo
+is a single rename, a new quant of an existing repo is placed file by file), and records which machine it came from.
+Dotfiles are skipped and paths are confined to the model folder.
 
 ### Machines, wanted state and reported state
 
@@ -94,7 +88,7 @@ speed and time left, measured from bytes that actually landed.
 ### What is protected
 
 - The share is read-only for the account machines mount with; only the container writes to it.
-- The config folder with the Hugging Face token and SMB password is mode 700, so it is invisible over SMB.
+- The config folder with the SMB password and the database is mode 700, so it is invisible over SMB.
 - The script only touches paths inside the machine's models folder, and only for library entries.
 - The web UI has no authentication. Keep it on the LAN. Anyone on the LAN can queue downloads or delete library
   entries, and can read the per-machine script, which carries the read-only SMB credentials.
@@ -103,8 +97,7 @@ speed and time left, measured from bytes that actually landed.
 
 **Setting up**
 
-1. Deploy (below), open the UI, and in Settings enter the SMB share name, the read-only account and its password,
-   and a Hugging Face token if you want gated models. Set your preferred GGUF quant.
+1. Deploy (below), open the UI, and in Settings enter the SMB share name, the read-only account and its password.
 2. Add each computer on the Machines page. Defaults are right for a standard LM Studio install.
 3. On each computer, run its one-liner once and choose **m** so the share mounts at login and is re-checked every
    five minutes. Linked models depend on that mount.
@@ -120,10 +113,11 @@ speed and time left, measured from bytes that actually landed.
 
 **Adding models**
 
-- Use Search. For GGUF repos pick the quants you want; the file picker pre-selects your preferred quant, and each
-  becomes its own library entry. For MLX repos take the whole repository.
-- Quants you already have on a machine show up in the script's "Local quants not in the library" list and on that
-  machine's card. Type their label, such as `u2`, to upload one. The copy you already have then counts as Cached.
+- Download in LM Studio on whichever machine you are testing on. When a model earns its keep, run that machine's
+  one-liner: the quant appears under "Local quants not in the library" and on the machine's card. Type its label, such
+  as `u2`, to upload it. The copy you already have then counts as Cached, and every other machine can now Cache or
+  Link it.
+- MLX repos upload as one quant; GGUF repos upload one quant at a time, plus a vision projector if the folder has one.
 
 **Keeping the matrix truthful**
 
@@ -150,7 +144,7 @@ speed and time left, measured from bytes that actually landed.
   reuses its account automatically.
 - *A model shows partial*: set Cached again; rsync resumes the copy.
 - *Upload interrupted*: run the same command again; it continues from what the NAS already has.
-- *Deploying says transfers are in progress*: an upload or download is running; wait, or `deploy.sh up --force`.
+- *Deploying says transfers are in progress*: an upload is running; wait, or `deploy.sh up --force`.
 
 ## Deploy on the NAS (UGOS Pro)
 
@@ -162,7 +156,7 @@ Layout on the NAS, everything inside one shared folder:
   .incoming/                    download and upload scratch, same filesystem so the final move is atomic
   lmscache/
     src/                        this repository; UGOS's Docker project points at src/docker-compose.yaml
-    config/                     settings.json (HF token, SMB password), lmscache.sqlite, hf-home; chmod 700
+    config/                     settings.json (SMB password), lmscache.sqlite; chmod 700
 ```
 
 1. **Shared folder.** In UGOS, create the shared folder and give a dedicated read-only account (here `lmscache`)
@@ -180,7 +174,7 @@ Layout on the NAS, everything inside one shared folder:
 5. Open `http://<your-nas>:8080`.
 
 `LMSCACHE_UID` and `LMSCACHE_GID` in `deploy.env` must be able to write to the share; `1000:10` is the first UGOS admin
-user, which is also what UGOS suggests as PUID and PGID. The container needs outbound internet for Hugging Face and nothing else.
+user, which is also what UGOS suggests as PUID and PGID. The container needs no internet access at all.
 
 ## Development
 
@@ -191,13 +185,12 @@ scripts/deploy.sh up      # build and (re)start on the NAS; refuses while transf
 scripts/deploy.sh logs    # follow the container log
 ```
 
-Layout: `lmscache/app.py` (API routes), `hf.py` (Hub search, file grouping by quant), `downloads.py` (queue, runs
-`hf download` into `.incoming/`), `uploads.py` (resumable uploads from machines), `catalog.py` (folder scan, metadata,
-atomic placement into the library), `machines.py` (profiles, wanted states, reports, and the generated client script),
-`static/` (the UI, plain JavaScript, no build step).
+Layout: `lmscache/app.py` (API routes), `uploads.py` (resumable uploads from machines), `catalog.py` (folder scan,
+quant grouping, atomic placement into the library), `machines.py` (profiles, wanted states, reports, classification and
+the generated client script), `util.py` (quant detection and grouping), `static/` (the UI, plain JavaScript, no build
+step). Dependencies: FastAPI and uvicorn, nothing else.
 
-API in one breath: `GET /api/state` is everything the UI shows; `GET /api/search`, `GET /api/repo/<owner>/<repo>`
-and `POST /api/downloads` drive downloads; `PUT /api/machines/<name>/models/<owner>/<repo>` records a wanted state;
-`GET /api/machines/<name>/plan` and `POST /api/machines/<name>/report` are what the client script talks to;
-`GET`, `PUT`, `POST …/commit` under `/api/upload/<owner>/<repo>` handle uploads; `GET /api/events` streams change
-notifications; `GET /lmsc/<machine>.sh` is the client script.
+API in one breath: `GET /api/state` is everything the UI shows; `PUT /api/machines/<name>/models/<owner>/<repo>@<quant>`
+records a wanted state; `POST /api/machines/<name>/report` takes the client's file scan and returns its plan; `GET`,
+`PUT`, `POST …/commit` under `/api/upload/<owner>/<repo>` handle uploads; `DELETE /api/library/<owner>/<repo>?variant=`
+removes a quant; `GET /api/events` streams change notifications; `GET /lmsc/<machine>.sh` is the client script.

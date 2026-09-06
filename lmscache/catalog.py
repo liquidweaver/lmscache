@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 from . import config, db
-from .util import detect_quant, is_mmproj, quant_rank, valid_repo_id, variants_for
+from .util import quant_rank, valid_repo_id, variants_for
 
 _lock = threading.Lock()
 _models: dict[str, dict] = {}
@@ -47,21 +47,6 @@ def detect_format(publisher: str, repo: str, paths: list[str], tags: list[str] |
     return "other"
 
 
-def quants_for(fmt: str, repo: str, paths: list[str]) -> list[str]:
-    qs: set[str] = set()
-    if fmt == "gguf":
-        for p in paths:
-            if p.lower().endswith(".gguf") and not is_mmproj(p):
-                q = detect_quant(p)
-                if q:
-                    qs.add(q)
-    else:
-        q = detect_quant(repo)
-        if q:
-            qs.add(q)
-    return sorted(qs)
-
-
 def scan() -> dict[str, dict]:
     global _models, _scanned_at
     lib = config.LIBRARY_DIR
@@ -77,9 +62,7 @@ def scan() -> dict[str, dict]:
                 mid = f"{pub.name}/{repo.name}"
                 files = _walk_files(repo)
                 meta = metas.get(mid) or {}
-                paths = [f["path"] for f in files]
-                tags = (meta.get("hf") or {}).get("tags") or []
-                fmt = detect_format(pub.name, repo.name, paths, tags)
+                fmt = detect_format(pub.name, repo.name, [f["path"] for f in files])
                 try:
                     mtime = repo.stat().st_mtime
                 except OSError:
@@ -100,8 +83,6 @@ def scan() -> dict[str, dict]:
                     "file_count": len(files),
                     "total_bytes": sum(f["size"] for f in files),
                     "added_at": meta.get("added_at") or mtime,
-                    "revision": meta.get("revision"),
-                    "hf": meta.get("hf"),
                     "source": meta.get("source"),
                 }
     with _lock:
