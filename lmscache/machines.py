@@ -147,11 +147,16 @@ def _valid(report: dict | None) -> bool:
 def report_summary(report: dict | None) -> dict | None:
     if not report:
         return None
+    models = report.get("models") or []
+    if isinstance(models, dict):  # reports from before the per-quant protocol
+        count = len(models)
+    else:
+        count = sum(1 for m in models if isinstance(m, dict) and (m.get("link") or m.get("files")))
     return {
-        "at": report["at"],
+        "at": report.get("at", 0),
         "free_bytes": report.get("free_bytes", 0),
         "total_bytes": report.get("total_bytes", 0),
-        "count": sum(1 for m in report.get("models", []) if m.get("link") or m.get("files")),
+        "count": count,
         "stale": not _valid(report),
     }
 
