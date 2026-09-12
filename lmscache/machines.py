@@ -8,7 +8,7 @@ import time
 from urllib.parse import quote, urlsplit
 
 from . import config, db
-from .catalog import detect_format
+from .catalog import detect_format, is_transient
 from .util import is_mmproj, valid_repo_id, valid_variant_id, variants_for
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
@@ -144,7 +144,7 @@ def _clean_models(entries, link_values=(True, False)) -> list[dict]:
         files = []
         for f in entry.get("files") or []:
             path = _clean_path(str(f.get("path") or ""))
-            if path is None:
+            if path is None or is_transient(path.rsplit("/", 1)[-1]):
                 continue
             link = f.get("link")
             if link is True or link in ("primary", "share", "other"):
@@ -152,7 +152,8 @@ def _clean_models(entries, link_values=(True, False)) -> list[dict]:
             else:
                 link = False
             files.append({"path": path, "size": int(f.get("size") or 0), "link": link})
-        models.append({"id": mid, "link": bool(entry.get("link")), "files": files})
+        hint = entry.get("hint")
+        models.append({"id": mid, "link": bool(entry.get("link")), "files": files, "hint": hint if hint in ("mlx",) else None})
     return models
 
 
@@ -286,7 +287,7 @@ def classify(models: dict[str, dict], report: dict | None) -> tuple[dict[str, di
             if not files:
                 continue
             pub, repo = rid.split("/", 1)
-            fmt = detect_format(pub, repo, [f["path"] for f in files], [])
+            fmt = detect_format(pub, repo, [f["path"] for f in files], hint=rm.get("hint"))
             for x in _foreign_variants(rid, fmt, files, None):
                 if x["id"] in seen_foreign:
                     continue
@@ -574,19 +575,28 @@ safe_rm_under() {  # like safe_rm, confined to an arbitrary store root ($1) inst
 }
 
 # ----- scan local folders and exchange with the NAS -----
+list_files() {  # $1 = folder -> relative paths of its files and symlinks, skipping hidden entries and in-progress downloads
+  ( cd "$1" 2>/dev/null && find . \( -type f -o -type l \) ! -name '.*' ! -path '*/.*' ! -name 'downloading_*' ! -name '*.part' ! -name '*.incomplete' ! -name '*.tmp' ! -name '*.crdownload' ! -name '*.partial' 2>/dev/null | sed 's#^\./##' | sort )
+}
+mlx_hint() {  # $1 = folder: "mlx" when config.json shows an MLX quantization block (group_size + bits, no quant_method)
+  local c="$1/config.json"
+  [ -f "$c" ] || [ -L "$c" ] || return 0
+  if grep -q '"group_size"' "$c" 2>/dev/null && grep -q '"bits"' "$c" 2>/dev/null && ! grep -q '"quant_method"' "$c" 2>/dev/null; then printf 'mlx'; fi
+}
 emit_store_model() {  # $1 = id, $2 = folder, $3 = store root ; prints one JSON model object for a provider store
-  local id="$1" dir="$2" root="$3" p rel size link ffirst=1 kind r
-  printf '{"id":"%s","link":false,"files":[' "$(esc "$id")"
-  while IFS= read -r p; do
-    [ -n "$p" ] || continue
-    rel=${p#"$dir"/}
+  local id="$1" dir="$2" root="$3" p rel size link ffirst=1 kind r hint
+  hint=$(mlx_hint "$dir")
+  printf '{"id":"%s","link":false,"hint":"%s","files":[' "$(esc "$id")" "$hint"
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    p="$dir/$rel"
     if [ -L "$p" ]; then
       kind=$(link_kind "$p" "$root")
       if [ "$kind" = real ]; then r=$(resolve_link "$p"); size=$(wc -c < "$r" | tr -d ' '); link=false; else size=0; link="\"$kind\""; fi
     else link=false; size=$(wc -c < "$p" | tr -d ' '); fi
     [ $ffirst -eq 1 ] || printf ','; ffirst=0
     printf '{"path":"%s","size":%s,"link":%s}' "$(esc "$rel")" "${size:-0}" "$link"
-  done <<< "$(find "$dir" \( -type f -o -type l \) ! -name '.*' ! -path '*/.*' 2>/dev/null | sort)"
+  done <<< "$(list_files "$dir")"
   printf ']}'
 }
 
@@ -634,15 +644,15 @@ scan_json() {  # every publisher/repo folder with its files (path, size, whether
       [ -d "$repo" ] || continue
       [ $first -eq 1 ] || printf ','; first=0
       if [ -L "$repo" ]; then printf '{"id":"%s","link":true,"files":[]}' "$(esc "$repo")"; continue; fi
-      printf '{"id":"%s","link":false,"files":[' "$(esc "$repo")"
+      printf '{"id":"%s","link":false,"hint":"%s","files":[' "$(esc "$repo")" "$(mlx_hint "$repo")"
       ffirst=1
-      while IFS= read -r p; do
-        [ -n "$p" ] || continue
-        rel=${p#"$repo"/}
+      while IFS= read -r rel; do
+        [ -n "$rel" ] || continue
+        p="$repo/$rel"
         if [ -L "$p" ]; then link=true; size=0; else link=false; size=$(wc -c < "$p" | tr -d ' '); fi
         [ $ffirst -eq 1 ] || printf ','; ffirst=0
         printf '{"path":"%s","size":%s,"link":%s}' "$(esc "$rel")" "${size:-0}" "$link"
-      done <<< "$(find "$repo" \( -type f -o -type l \) ! -name '.*' ! -path '*/.*' 2>/dev/null | sort)"
+      done <<< "$(list_files "$repo")"
       printf ']}'
     done
   done

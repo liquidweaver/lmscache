@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import threading
@@ -16,12 +17,18 @@ _models: dict[str, dict] = {}
 _scanned_at: float = 0.0
 
 
+def is_transient(name: str) -> bool:
+    """Files a downloader is still writing (LM Studio, huggingface_hub, browsers)."""
+    low = name.lower()
+    return low.startswith("downloading_") or low.endswith((".part", ".incomplete", ".tmp", ".crdownload", ".partial"))
+
+
 def _walk_files(root: Path) -> list[dict]:
     files: list[dict] = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if not d.startswith(".")]
         for fn in filenames:
-            if fn.startswith("."):
+            if fn.startswith(".") or is_transient(fn):
                 continue
             p = Path(dirpath) / fn
             try:
@@ -35,16 +42,35 @@ def _walk_files(root: Path) -> list[dict]:
     return files
 
 
-def detect_format(publisher: str, repo: str, paths: list[str], tags: list[str] | None = None) -> str:
+def is_mlx_config(cfg: dict) -> bool:
+    """MLX conversions (mlx-lm, oMLX) carry a quantization block with group_size and bits and no quant_method."""
+    for key in ("quantization", "quantization_config"):
+        q = cfg.get(key)
+        if isinstance(q, dict) and "quant_method" not in q and "bits" in q and "group_size" in q:
+            return True
+    return False
+
+
+def detect_format(publisher: str, repo: str, paths: list[str], hint: str | None = None, config: dict | None = None) -> str:
     low = [p.lower() for p in paths]
     if any(p.endswith(".gguf") for p in low):
         return "gguf"
     if any(p.endswith(".safetensors") for p in low):
-        tags = [t.lower() for t in (tags or [])]
-        if "mlx" in tags or "mlx" in publisher.lower() or "mlx" in repo.lower():
+        if hint == "mlx" or (config and is_mlx_config(config)) or "mlx" in publisher.lower() or "mlx" in repo.lower():
             return "mlx"
         return "safetensors"
     return "other"
+
+
+def _read_config(folder: Path) -> dict | None:
+    try:
+        cfg = folder / "config.json"
+        if cfg.is_file() and cfg.stat().st_size < 4_000_000:
+            data = json.loads(cfg.read_text())
+            return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+    return None
 
 
 def scan() -> dict[str, dict]:
@@ -62,7 +88,7 @@ def scan() -> dict[str, dict]:
                 mid = f"{pub.name}/{repo.name}"
                 files = _walk_files(repo)
                 meta = metas.get(mid) or {}
-                fmt = detect_format(pub.name, repo.name, [f["path"] for f in files])
+                fmt = detect_format(pub.name, repo.name, [f["path"] for f in files], config=_read_config(repo))
                 try:
                     mtime = repo.stat().st_mtime
                 except OSError:
