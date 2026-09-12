@@ -84,6 +84,7 @@ def scan() -> dict[str, dict]:
                     "total_bytes": sum(f["size"] for f in files),
                     "added_at": meta.get("added_at") or mtime,
                     "source": meta.get("source"),
+                    "revision": meta.get("revision"),
                 }
     with _lock:
         _models = found

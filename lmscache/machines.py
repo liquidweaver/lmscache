@@ -13,6 +13,13 @@ from .util import is_mmproj, valid_repo_id, valid_variant_id, variants_for
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
 STATES = ("absent", "cached", "linked")
+# Other model stores on a machine. They never hold a second copy: quants are projected into them as symlinks to the
+# primary (LM Studio layout) store, in each store's own layout.
+PROVIDER_KINDS = {
+    "omlx": {"label": "oMLX", "layout": "flat", "formats": ["mlx"], "default": "~/.omlx/models"},
+    "vllm": {"label": "vLLM (Hugging Face cache)", "layout": "hfcache", "formats": ["safetensors"], "default": "~/.cache/huggingface/hub"},
+    "hfcache": {"label": "Hugging Face cache (mlx-lm, transformers)", "layout": "hfcache", "formats": ["mlx", "safetensors"], "default": "~/.cache/huggingface/hub"},
+}
 OS_DEFAULTS = {
     "mac": {"models_dir": "~/.lmstudio/models", "mount": "/Users/Shared/lmscache"},
     "linux": {"models_dir": "~/.lmstudio/models", "mount": "/mnt/lmscache"},
@@ -43,6 +50,7 @@ def upsert(data: dict) -> dict:
         "models_dir": (data.get("models_dir") or existing.get("models_dir") or OS_DEFAULTS[os_]["models_dir"]).strip(),
         "mount": (data.get("mount") or existing.get("mount") or OS_DEFAULTS[os_]["mount"]).strip().rstrip("/"),
         "smb_user": (data.get("smb_user") or "").strip() or None,
+        "providers": _clean_providers(data.get("providers") if data.get("providers") is not None else existing.get("providers")),
         "created_at": existing.get("created_at") or time.time(),
     }
     for key in ("models_dir", "mount"):
@@ -50,6 +58,21 @@ def upsert(data: dict) -> dict:
             raise ValueError(f"{key} must be an absolute path or start with ~")
     db.put_json("machines", "name", name, "data", profile)
     return profile
+
+
+def _clean_providers(raw) -> list[dict]:
+    out: list[dict] = []
+    seen: set[str] = set()
+    for entry in raw or []:
+        kind = str((entry or {}).get("kind") or "")
+        if kind not in PROVIDER_KINDS or kind in seen:
+            continue
+        path = (str((entry or {}).get("path") or "").strip() or PROVIDER_KINDS[kind]["default"]).rstrip("/")
+        if not path.startswith(("/", "~")):
+            raise ValueError(f"{PROVIDER_KINDS[kind]['label']} path must be absolute or start with ~")
+        seen.add(kind)
+        out.append({"kind": kind, "path": path})
+    return out
 
 
 def rename(old: str, new: str) -> dict:
@@ -112,10 +135,10 @@ def _clean_path(path: str) -> str | None:
     return path
 
 
-def store_report(machine: str, payload: dict) -> dict:
+def _clean_models(entries, link_values=(True, False)) -> list[dict]:
     models = []
-    for entry in payload.get("models") or []:
-        mid = str(entry.get("id") or "")
+    for entry in entries or []:
+        mid = str((entry or {}).get("id") or "")
         if not valid_repo_id(mid):
             continue
         files = []
@@ -123,14 +146,31 @@ def store_report(machine: str, payload: dict) -> dict:
             path = _clean_path(str(f.get("path") or ""))
             if path is None:
                 continue
-            files.append({"path": path, "size": int(f.get("size") or 0), "link": bool(f.get("link"))})
+            link = f.get("link")
+            if link is True or link in ("primary", "share", "other"):
+                link = link if isinstance(link, str) else "share"
+            else:
+                link = False
+            files.append({"path": path, "size": int(f.get("size") or 0), "link": link})
         models.append({"id": mid, "link": bool(entry.get("link")), "files": files})
+    return models
+
+
+def store_report(machine: str, payload: dict) -> dict:
+    models = _clean_models(payload.get("models"))
+    providers = []
+    for prov in payload.get("providers") or []:
+        kind = str((prov or {}).get("kind") or "")
+        if kind not in PROVIDER_KINDS:
+            continue
+        providers.append({"kind": kind, "path": str(prov.get("path") or ""), "models": _clean_models(prov.get("models"))})
     report = {
         "v": 2,
         "at": time.time(),
         "free_bytes": int(payload.get("free_bytes") or 0),
         "total_bytes": int(payload.get("total_bytes") or 0),
         "models": models,
+        "providers": providers,
     }
     db.put_json("reports", "machine", machine, "data", report, {"at": report["at"]})
     return report
@@ -176,53 +216,83 @@ def _foreign_variants(rid: str, fmt: str, files: list[dict], model: dict | None)
     return out
 
 
+def _variant_state(v: dict, local: dict, folder_link: bool) -> tuple[str, int]:
+    """State of one variant against the files a store reported: cached (all real), linked, partial or absent."""
+    n = len(v["files"])
+    real = link = 0
+    real_bytes = 0
+    for f in v["files"]:
+        lf = local.get(f["path"])
+        if folder_link or (lf and lf.get("link")):
+            link += 1
+        elif lf and lf["size"] == f["size"]:
+            real += 1
+            real_bytes += f["size"]
+        elif lf:
+            real_bytes += lf["size"]
+    if n and real == n:
+        return "cached", real_bytes
+    if n and link == n:
+        return "linked", real_bytes
+    if real == 0 and link == 0 and real_bytes == 0:
+        return "absent", 0
+    return "partial", real_bytes
+
+
+def compatible(kind: str, fmt: str) -> bool:
+    return fmt in PROVIDER_KINDS.get(kind, {}).get("formats", [])
+
+
 def classify(models: dict[str, dict], report: dict | None) -> tuple[dict[str, dict], list[dict]]:
-    """Per library variant: reported state and real bytes present; plus local variants the library lacks."""
+    """Per library variant: reported state in the primary store, per-provider state, real bytes; plus local
+    variants the library lacks, from the primary store or any provider."""
     states: dict[str, dict] = {}
     foreign: list[dict] = []
+    seen_foreign: set[str] = set()
     valid = _valid(report)
     rep_models = {m["id"]: m for m in report.get("models", [])} if valid else {}
+    providers = (report or {}).get("providers", []) if valid else []
     for mid, model in models.items():
         rm = rep_models.get(mid)
         local = {f["path"]: f for f in rm.get("files", [])} if rm else {}
         folder_link = bool(rm and rm.get("link"))
         for v in model["variants"]:
-            n = len(v["files"])
-            real = link = 0
-            real_bytes = 0
-            for f in v["files"]:
-                lf = local.get(f["path"])
-                if folder_link or (lf and lf.get("link")):
-                    link += 1
-                elif lf and lf["size"] == f["size"]:
-                    real += 1
-                    real_bytes += f["size"]
-                elif lf:
-                    real_bytes += lf["size"]
             if not valid:
-                state = None
-            elif n and real == n:
-                state = "cached"
-            elif n and link == n:
-                state = "linked"
-            elif real == 0 and link == 0 and real_bytes == 0:
-                state = "absent"
-            else:
-                state = "partial"
-            states[v["id"]] = {"reported": state, "bytes": real_bytes}
+                states[v["id"]] = {"reported": None, "bytes": 0, "providers": {}}
+                continue
+            state, real_bytes = _variant_state(v, local, folder_link)
+            prov_states = {}
+            for prov in providers:
+                if not compatible(prov["kind"], model["format"]):
+                    continue
+                pm = next((m for m in prov["models"] if m["id"] == mid), None)
+                plocal = {f["path"]: f for f in pm.get("files", [])} if pm else {}
+                pstate, pbytes = _variant_state(v, plocal, bool(pm and pm.get("link")))
+                prov_states[prov["kind"]] = {"state": "real" if pstate == "cached" else pstate, "bytes": pbytes}
+            states[v["id"]] = {"reported": state, "bytes": real_bytes, "providers": prov_states}
         if rm and not folder_link and model["format"] == "gguf":
             known = {f["path"] for v in model["variants"] for f in v["files"]} | {f["path"] for f in model.get("shared") or []}
             extra = [f for f in rm["files"] if f["path"] not in known and not f.get("link")]
-            foreign += _foreign_variants(mid, "gguf", extra, model)
-    for rid, rm in rep_models.items():
-        if rid in models or rm.get("link"):
-            continue
-        files = [f for f in rm["files"] if not f.get("link")]
-        if not files:
-            continue
-        pub, repo = rid.split("/", 1)
-        fmt = detect_format(pub, repo, [f["path"] for f in files], [])
-        foreign += _foreign_variants(rid, fmt, files, None)
+            for x in _foreign_variants(mid, "gguf", extra, model):
+                x["source"] = "primary"
+                foreign.append(x)
+                seen_foreign.add(x["id"])
+    stores = [("primary", rep_models)] + [(prov["kind"], {m["id"]: m for m in prov["models"]}) for prov in providers]
+    for source, store in stores:
+        for rid, rm in store.items():
+            if rid in models or rm.get("link"):
+                continue
+            files = [f for f in rm["files"] if not f.get("link")]
+            if not files:
+                continue
+            pub, repo = rid.split("/", 1)
+            fmt = detect_format(pub, repo, [f["path"] for f in files], [])
+            for x in _foreign_variants(rid, fmt, files, None):
+                if x["id"] in seen_foreign:
+                    continue
+                x["source"] = source
+                foreign.append(x)
+                seen_foreign.add(x["id"])
     foreign.sort(key=lambda x: x["id"].lower())
     return states, foreign
 
@@ -236,7 +306,7 @@ def cells(models: dict[str, dict], machine_names: list[str], intents_map: dict, 
         for vid, st in states.items():
             intent = (my.get(vid) or {}).get("state")
             reported = st["reported"]
-            row[vid] = {"reported": reported, "bytes": st["bytes"], "intent": intent, "pending": bool(intent) and (reported is None or intent != reported)}
+            row[vid] = {"reported": reported, "bytes": st["bytes"], "intent": intent, "pending": bool(intent) and (reported is None or intent != reported), "providers": st.get("providers", {})}
         out[name] = row
     return out
 
@@ -250,25 +320,35 @@ def foreign(models: dict[str, dict], reports_map: dict) -> dict[str, list[dict]]
     return out
 
 
-def plan_text(models: dict[str, dict], machine_name: str, report: dict | None) -> str:
+def plan_text(models: dict[str, dict], machine_name: str, report: dict | None, machine: dict | None = None) -> str:
     """What the client script works from. Tab separated lines:
-    V variant bytes local wanted real_bytes | F variant path size | S repo path size | X foreign_variant bytes | XF foreign_variant path size"""
+    P kind path layout | V variant bytes local wanted real_bytes | F variant path size | PV variant kind state real_bytes
+    | S repo path size | R repo revision | X foreign_variant bytes source | XF foreign_variant path size"""
     states, extras = classify(models, report)
     wanted = intents().get(machine_name, {})
+    provs = (machine or {}).get("providers") or []
     lines: list[str] = []
+    for prov in provs:
+        lines.append("\t".join(["P", prov["kind"], prov["path"], PROVIDER_KINDS[prov["kind"]]["layout"]]))
     for m in sorted(models.values(), key=lambda m: m["id"].lower()):
         for v in m["variants"]:
-            st = states.get(v["id"]) or {"reported": None, "bytes": 0}
+            st = states.get(v["id"]) or {"reported": None, "bytes": 0, "providers": {}}
             want = (wanted.get(v["id"]) or {}).get("state") or "-"
             lines.append("\t".join(["V", v["id"], str(v["bytes"]), st["reported"] or "-", want, str(st["bytes"])]))
             for f in v["files"]:
                 if _clean_path(f["path"]):
                     lines.append("\t".join(["F", v["id"], f["path"], str(f["size"])]))
+            for prov in provs:
+                if compatible(prov["kind"], m["format"]):
+                    ps = (st.get("providers") or {}).get(prov["kind"]) or {"state": "-", "bytes": 0}
+                    lines.append("\t".join(["PV", v["id"], prov["kind"], ps["state"] or "-", str(ps["bytes"])]))
         for f in m.get("shared") or []:
             if _clean_path(f["path"]):
                 lines.append("\t".join(["S", m["id"], f["path"], str(f["size"])]))
+        if m.get("revision"):
+            lines.append("\t".join(["R", m["id"], str(m["revision"])]))
     for x in extras:
-        lines.append("\t".join(["X", x["id"], str(x["bytes"])]))
+        lines.append("\t".join(["X", x["id"], str(x["bytes"]), x.get("source") or "primary"]))
         for f in x["files"]:
             lines.append("\t".join(["XF", x["id"], f["path"], str(f["size"])]))
     return "\n".join(lines) + ("\n" if lines else "")
@@ -319,6 +399,9 @@ def client_script(machine: dict, base: str, host: str, settings: dict) -> str:
         "SMB_USER_URL": quote(user, safe=""),
         "SMB_PASS": password.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "\\`"),
         "SMB_PASS_URL": quote(password, safe=""),
+        "PROVIDERS": "\n".join(
+            "\t".join([prov["kind"], _sh_path(prov["path"]), PROVIDER_KINDS[prov["kind"]]["layout"]]) for prov in machine.get("providers") or []
+        ),
     }
     script = _CLIENT_TEMPLATE
     for key, val in values.items():
@@ -338,6 +421,7 @@ NAS="@@NAS@@"; MACHINE="@@MACHINE@@"; OS="@@OS@@"
 MODELS_DIR="@@MODELS_DIR@@"; MOUNT="@@MOUNT@@"; LIB="$MOUNT/lmstudio"
 SMB_HOST="@@SMB_HOST@@"; SMB_SHARE="@@SMB_SHARE@@"; SMB_SHARE_URL="@@SMB_SHARE_URL@@"; SMB_SHARE_FSTAB="@@SMB_SHARE_FSTAB@@"
 SMB_USER="@@SMB_USER@@"; SMB_USER_URL="@@SMB_USER_URL@@"; SMB_PASS="@@SMB_PASS@@"; SMB_PASS_URL="@@SMB_PASS_URL@@"; SMB_USER_SOURCE="@@SMB_USER_SOURCE@@"
+PROVIDERS_BOOT="@@PROVIDERS@@"
 
 AUTO=0; REPORT_ONLY=0; YES=0; UPLOAD=""
 while [ $# -gt 0 ]; do
@@ -353,7 +437,10 @@ TAB=$'\t'
 # library variants (one loadable quant each) as parallel arrays, filled by sync_state
 N=0; NX=0; PEND=0
 VID=(); VBYTES=(); VLOCAL=(); VWANT=(); VREAL=(); VFILES=()
-XID=(); XBYTES=(); XFILES=(); SFILES=""
+XID=(); XBYTES=(); XFILES=(); XSRC=(); SFILES=""
+NP=0; PK=(); PP=(); PL=()          # providers on this machine: kind, path, layout
+VPROV=()                          # per variant: provider states as lines kind<TAB>state<TAB>real_bytes
+RREV=""                           # known revisions: repo<TAB>rev lines (used for Hugging Face cache folder names)
 # the interactive menu stages everything; nothing runs until "commit and quit"
 SN=0; SIDS=(); SSTATES=()      # staged state changes, by variant id
 UN=0; UIDS=()                  # staged uploads, by foreign variant id
@@ -449,9 +536,91 @@ ensure_mount() {
   [ -d "$LIB" ]
 }
 
+# ----- symlink inspection and provider layouts -----
+resolve_link() {  # follow a symlink chain (up to 8 hops); prints the final regular file, or nothing
+  local p="$1" t i
+  for ((i=0;i<8;i++)); do
+    if [ ! -L "$p" ]; then [ -f "$p" ] && printf '%s' "$p"; return; fi
+    t=$(readlink "$p"); case "$t" in /*) ;; *) t="$(dirname "$p")/$t";; esac; p="$t"
+  done
+}
+link_kind() {  # $1 = symlink, $2 = its store root -> primary | share | real (data inside that store, e.g. a Hugging Face blob) | other
+  local t r; t=$(readlink "$1")
+  case "$t" in /*) ;; *) t="$(dirname "$1")/$t";; esac
+  case "$t" in "$MODELS_DIR"/*) echo primary; return;; "$LIB"/*|"$MOUNT"/*) echo share; return;; esac
+  r=$(resolve_link "$1")
+  if [ -n "$r" ]; then case "$r" in "$2"/*) echo real; return;; "$MODELS_DIR"/*) echo primary; return;; "$LIB"/*|"$MOUNT"/*) echo share; return;; esac; fi
+  echo other
+}
+expand_home() { case "$1" in "~"*) printf '%s%s' "$HOME" "${1#\~}";; *) printf '%s' "$1";; esac; }
+prov_index() { local i; for ((i=0;i<NP;i++)); do [ "${PK[i]}" = "$1" ] && { echo "$i"; return; }; done; echo -1; }
+rev_for() { printf '%s' "$RREV" | awk -F"$TAB" -v r="$1" '$1==r{print $2; exit}'; }
+prov_base() { printf '%s/models--%s' "${PP[$1]}" "${2//\//--}"; }   # hfcache: $1 = provider index, $2 = repo
+prov_rev() {  # revision folder to use in a Hugging Face cache for a repo: the cache's own, else the library's, else a fixed name
+  local base rev; base=$(prov_base "$1" "$2")
+  if [ -f "$base/refs/main" ]; then rev=$(head -c 200 "$base/refs/main" | tr -d '[:space:]'); [ -n "$rev" ] && { printf '%s' "$rev"; return; }; fi
+  rev=$(rev_for "$2"); printf '%s' "${rev:-lmscache}"
+}
+prov_repo_dir() {  # $1 = provider index, $2 = repo -> the folder that holds this repo's files in that store
+  if [ "${PL[$1]}" = hfcache ]; then printf '%s/snapshots/%s' "$(prov_base "$1" "$2")" "$(prov_rev "$1" "$2")"; else printf '%s/%s' "${PP[$1]}" "$2"; fi
+}
+safe_rm_under() {  # like safe_rm, confined to an arbitrary store root ($1) instead of the models folder
+  local root="${1%/}" t="$2"
+  [ -n "$root" ] && [ -n "$t" ] || { echo "refusing to remove: empty path" >&2; return 1; }
+  case "$root" in /?*) ;; *) echo "refusing to remove under '$root'" >&2; return 1;; esac
+  case "$t" in "$root"/?*) ;; *) echo "refusing to remove $t: outside $root" >&2; return 1;; esac
+  case "$t" in *"/../"*|*"/.."|*"//"*) echo "refusing to remove $t: suspicious path" >&2; return 1;; esac
+  if [ -L "$t" ] || [ -f "$t" ]; then rm -f "$t"; elif [ -d "$t" ]; then rm -rf "$t"; fi
+}
+
 # ----- scan local folders and exchange with the NAS -----
-scan_json() {  # every publisher/repo folder with its files (path, size, whether it is a symlink)
-  local pub repo p rel size link first=1 ffirst free total here
+emit_store_model() {  # $1 = id, $2 = folder, $3 = store root ; prints one JSON model object for a provider store
+  local id="$1" dir="$2" root="$3" p rel size link ffirst=1 kind r
+  printf '{"id":"%s","link":false,"files":[' "$(esc "$id")"
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    rel=${p#"$dir"/}
+    if [ -L "$p" ]; then
+      kind=$(link_kind "$p" "$root")
+      if [ "$kind" = real ]; then r=$(resolve_link "$p"); size=$(wc -c < "$r" | tr -d ' '); link=false; else size=0; link="\"$kind\""; fi
+    else link=false; size=$(wc -c < "$p" | tr -d ' '); fi
+    [ $ffirst -eq 1 ] || printf ','; ffirst=0
+    printf '{"path":"%s","size":%s,"link":%s}' "$(esc "$rel")" "${size:-0}" "$link"
+  done <<< "$(find "$dir" \( -type f -o -type l \) ! -name '.*' ! -path '*/.*' 2>/dev/null | sort)"
+  printf ']}'
+}
+
+scan_provider_json() {  # $1 = provider index ; prints {"kind":..,"path":..,"models":[...]}
+  local i="$1" root="${PP[$1]}" pub repo base id rev first=1
+  printf '{"kind":"%s","path":"%s","models":[' "${PK[i]}" "$(esc "$root")"
+  if [ -d "$root" ]; then
+    if [ "${PL[i]}" = flat ]; then
+      for pub in "$root"/*/; do
+        pub=${pub%/}; [ -d "$pub" ] || continue
+        case "${pub##*/}" in .*|models--*) continue;; esac
+        for repo in "$pub"/*; do
+          [ -d "$repo" ] || continue; case "${repo##*/}" in .*) continue;; esac
+          [ $first -eq 1 ] || printf ','; first=0
+          emit_store_model "${pub##*/}/${repo##*/}" "$repo" "$root"
+        done
+      done
+    else
+      for base in "$root"/models--*; do
+        [ -d "$base" ] || continue
+        id=${base##*/models--}; id=${id/--//}
+        rev=""; [ -f "$base/refs/main" ] && rev=$(head -c 200 "$base/refs/main" | tr -d '[:space:]')
+        [ -n "$rev" ] && [ -d "$base/snapshots/$rev" ] || rev=$(ls -t "$base/snapshots" 2>/dev/null | head -1)
+        [ -n "$rev" ] && [ -d "$base/snapshots/$rev" ] || continue
+        [ $first -eq 1 ] || printf ','; first=0
+        emit_store_model "$id" "$base/snapshots/$rev" "$root"
+      done
+    fi
+  fi
+  printf ']}'
+}
+
+scan_json() {  # every publisher/repo folder with its files (path, size, whether it is a symlink), plus each provider store
+  local pub repo p rel size link first=1 ffirst free total here i
   here=$(pwd)
   cd "$MODELS_DIR" 2>/dev/null || { printf '{"models":[]}'; return; }
   free=$(df -Pk . | awk 'NR==2{printf "%.0f", $4*1024}'); total=$(df -Pk . | awk 'NR==2{printf "%.0f", $2*1024}')
@@ -477,24 +646,41 @@ scan_json() {  # every publisher/repo folder with its files (path, size, whether
       printf ']}'
     done
   done
+  printf '],"providers":['
+  for ((i=0;i<NP;i++)); do [ $i -eq 0 ] || printf ','; scan_provider_json "$i"; done
   printf ']}'
   cd "$here"
 }
 
-sync_state() {  # report local state, receive the plan: library variants with local/wanted state, their files, foreign quants
-  local plan tag a b c d e cur=-1 xcur=-1 i
-  plan=$(scan_json | curl -fsS -X POST -H 'Content-Type: application/json' --data-binary @- "$NAS/api/machines/$MACHINE/report") || { echo "Cannot reach LMS Cache at $NAS" >&2; return 1; }
-  N=0; NX=0; VID=(); VBYTES=(); VLOCAL=(); VWANT=(); VREAL=(); VFILES=(); XID=(); XBYTES=(); XFILES=(); SFILES=""
+parse_plan() {
+  local tag a b c d e cur=-1 xcur=-1 i np=0
+  N=0; NX=0; VID=(); VBYTES=(); VLOCAL=(); VWANT=(); VREAL=(); VFILES=(); VPROV=(); XID=(); XBYTES=(); XFILES=(); XSRC=(); SFILES=""; RREV=""
+  PK=(); PP=(); PL=()
   while IFS="$TAB" read -r tag a b c d e; do
     case "$tag" in
-      V) VID[N]="$a"; VBYTES[N]="${b:-0}"; VLOCAL[N]="$c"; VWANT[N]="$d"; VREAL[N]="${e:-0}"; VFILES[N]=""; cur=$N; N=$((N+1));;
+      P) PK[np]="$a"; PP[np]="$(expand_home "$b")"; PL[np]="$c"; np=$((np+1));;
+      V) VID[N]="$a"; VBYTES[N]="${b:-0}"; VLOCAL[N]="$c"; VWANT[N]="$d"; VREAL[N]="${e:-0}"; VFILES[N]=""; VPROV[N]=""; cur=$N; N=$((N+1));;
       F) [ $cur -ge 0 ] && VFILES[cur]="${VFILES[cur]}$b$TAB$c"$'\n';;
+      PV) [ $cur -ge 0 ] && VPROV[cur]="${VPROV[cur]}$b$TAB$c$TAB${d:-0}"$'\n';;
       S) SFILES="$SFILES$a$TAB$b$TAB$c"$'\n';;
-      X) XID[NX]="$a"; XBYTES[NX]="${b:-0}"; XFILES[NX]=""; xcur=$NX; NX=$((NX+1));;
+      R) RREV="$RREV$a$TAB$b"$'\n';;
+      X) XID[NX]="$a"; XBYTES[NX]="${b:-0}"; XSRC[NX]="${c:-primary}"; XFILES[NX]=""; xcur=$NX; NX=$((NX+1));;
       XF) [ $xcur -ge 0 ] && XFILES[xcur]="${XFILES[xcur]}$b$TAB$c"$'\n';;
     esac
-  done <<< "$plan"
+  done <<< "$1"
+  NP=$np
   for ((i=0;i<N;i++)); do [ "${VWANT[i]}" = "-" ] && VWANT[i]=""; [ "${VLOCAL[i]}" = "-" ] && VLOCAL[i]="absent"; done
+}
+
+boot_providers() {  # the providers this machine's profile lists, so the very first scan covers them
+  local k p l; NP=0; PK=(); PP=(); PL=()
+  while IFS="$TAB" read -r k p l; do [ -n "$k" ] || continue; PK[NP]="$k"; PP[NP]="$(expand_home "$p")"; PL[NP]="$l"; NP=$((NP+1)); done <<< "$PROVIDERS_BOOT"
+}
+
+sync_state() {  # report local state (primary store and providers), receive the plan
+  local plan
+  plan=$(scan_json | curl -fsS -X POST -H 'Content-Type: application/json' --data-binary @- "$NAS/api/machines/$MACHINE/report") || { echo "Cannot reach LMS Cache at $NAS" >&2; return 1; }
+  parse_plan "$plan"
   return 0
 }
 
@@ -522,7 +708,7 @@ render() {
   local i mark w l c free repo quant
   free=$(df -Pk "$MODELS_DIR" 2>/dev/null | awk 'NR==2{printf "%.0f", $4*1024}')
   printf '\n%sLMS Cache%s · %s · library at %s · %s free locally\n\n' "$B" "$R" "$MACHINE" "$LIB" "$(hb "${free:-0}")"
-  printf '%s  %3s  %-46s %-11s %10s  %-8s %-8s%s\n' "$D" "#" "Model" "Quant" "Size" "Local" "Wanted" "$R"
+  printf '%s  %3s  %-46s %-11s %10s  %-8s %-8s %s%s\n' "$D" "#" "Model" "Quant" "Size" "Local" "Wanted" "$([ $NP -gt 0 ] && printf 'Also in')" "$R"
   PEND=0
   for ((i=0;i<N;i++)); do
     repo="${VID[i]%@*}"; quant="${VID[i]##*@}"
@@ -530,13 +716,22 @@ render() {
     if [ -n "$(staged_for "${VID[i]}")" ]; then mark=">"; c="$Y"
     elif is_pending "$i"; then mark="*"; c="$Y"; PEND=$((PEND+1)); fi
     [ "$l" = absent ] && l="-"
-    printf '%s%s %3d  %-46.46s %-11.11s %10s  %-8s %-8s%s\n' "$c" "$mark" "$((i+1))" "$repo" "$quant" "$(hb "${VBYTES[i]}")" "$l" "${w:--}" "$R"
+    printf '%s%s %3d  %-46.46s %-11.11s %10s  %-8s %-8s %s%s\n' "$c" "$mark" "$((i+1))" "$repo" "$quant" "$(hb "${VBYTES[i]}")" "$l" "${w:--}" "$(prov_summary "$i")" "$R"
   done
   [ "$N" -eq 0 ] && echo "  (the library is empty; upload a model you want to keep with u<number>)"
   if [ $NX -gt 0 ]; then
     printf '\n%sLocal quants not in the library%s (type a label such as u1 to stage an upload; type it again to unstage):\n' "$D" "$R"
     for ((i=0;i<NX;i++)); do printf '  u%-2d %-58.58s %10s%s\n' "$((i+1))" "${XID[i]}" "$(hb "${XBYTES[i]}")" "$(upload_staged "${XID[i]}" && printf '  %s> staged%s' "$Y" "$R")"; done
   fi
+}
+
+prov_summary() {  # short list of providers that hold this variant: kind, kind(real) for an unadopted local copy
+  local k st b out=""
+  while IFS="$TAB" read -r k st b; do
+    [ -n "$k" ] || continue
+    case "$st" in real) out="$out${out:+,}$k(copy)";; linked) out="$out${out:+,}$k";; partial) out="$out${out:+,}$k(part)";; esac
+  done <<< "${VPROV[$1]}"
+  printf '%s' "$out"
 }
 
 show_staged() {
@@ -622,12 +817,105 @@ do_remove() {  # drop this variant's files; the folder goes too when only shared
   return 0
 }
 
+prov_file_real() {  # $1 = provider index, $2 = file path in the store -> prints the real data file behind it, if the store owns it
+  local p="$2" r
+  if [ -L "$p" ]; then [ "$(link_kind "$p" "${PP[$1]}")" = real ] || return 1; r=$(resolve_link "$p"); [ -n "$r" ] && printf '%s' "$r"
+  elif [ -f "$p" ]; then printf '%s' "$p"; else return 1; fi
+}
+
+project_variant() {  # $1 = variant index. Every compatible provider ends up holding this quant as symlinks to the primary files.
+  local i="$1" vid="${VID[$1]}" repo pi k st b dir path size src real prim rev base
+  repo="${vid%@*}"; prim="$MODELS_DIR/$repo"
+  while IFS="$TAB" read -r k st b; do
+    [ -n "$k" ] || continue
+    pi=$(prov_index "$k"); [ "$pi" -ge 0 ] || continue
+    [ -d "${PP[pi]}" ] || mkdir -p "${PP[pi]}" 2>/dev/null || { echo "  cannot create ${PP[pi]} for $k" >&2; continue; }
+    dir=$(prov_repo_dir "$pi" "$repo")
+    if [ "${PL[pi]}" = hfcache ]; then
+      base=$(prov_base "$pi" "$repo"); rev=${dir##*/}
+      mkdir -p "$dir" "$base/refs" && { [ -f "$base/refs/main" ] || printf '%s' "$rev" > "$base/refs/main"; }
+    else
+      mkdir -p "$dir"
+    fi
+    while IFS="$TAB" read -r path size; do
+      valid_rel "$path" || continue
+      [ -e "$prim/$path" ] || [ -L "$prim/$path" ] || continue   # nothing to point at yet
+      src="$dir/$path"
+      if real=$(prov_file_real "$pi" "$src") && [ -n "$real" ]; then
+        # the provider owns a real copy: drop it, the primary is the single copy now
+        safe_rm_under "${PP[pi]}" "$real" 2>/dev/null || true
+      fi
+      mkdir -p "$(dirname "$src")"
+      rm -f "$src" 2>/dev/null || true
+      ln -s "$prim/$path" "$src"
+    done <<< "$(printf '%s' "${VFILES[i]}"; shared_for "$repo")"
+    printf '  %s: linked into %s\n' "$k" "$dir"
+  done <<< "${VPROV[i]}"
+}
+
+adopt_variant() {  # $1 = variant index. Real files a provider holds move into the primary store (no copy from the NAS needed).
+  local i="$1" vid="${VID[$1]}" repo pi k st b dir path size src real prim moved=0
+  repo="${vid%@*}"; prim="$MODELS_DIR/$repo"
+  while IFS="$TAB" read -r k st b; do
+    [ -n "$k" ] || continue
+    case "$st" in real|partial) ;; *) continue;; esac
+    pi=$(prov_index "$k"); [ "$pi" -ge 0 ] || continue
+    dir=$(prov_repo_dir "$pi" "$repo")
+    while IFS="$TAB" read -r path size; do
+      valid_rel "$path" || continue
+      [ -f "$prim/$path" ] && [ ! -L "$prim/$path" ] && continue          # primary already has a real file
+      src="$dir/$path"
+      real=$(prov_file_real "$pi" "$src") || continue
+      [ -n "$real" ] || continue
+      [ "$(wc -c < "$real" | tr -d ' ')" = "$size" ] || continue          # only exact matches
+      mkdir -p "$(dirname "$prim/$path")"
+      [ -L "$prim/$path" ] && safe_rm "$prim/$path"
+      mv "$real" "$prim/$path" || continue
+      moved=$((moved+1))
+    done <<< "$(printf '%s' "${VFILES[i]}"; shared_for "$repo")"
+  done <<< "${VPROV[i]}"
+  [ $moved -gt 0 ] && printf '  adopted %d file(s) already on this machine into %s\n' "$moved" "$prim"
+  return 0
+}
+
+unproject_variant() {  # $1 = variant index. Remove this quant from every provider; drop empty containers.
+  local i="$1" vid="${VID[$1]}" repo pi k st b dir path size src real base left
+  repo="${vid%@*}"
+  while IFS="$TAB" read -r k st b; do
+    [ -n "$k" ] || continue
+    pi=$(prov_index "$k"); [ "$pi" -ge 0 ] || continue
+    dir=$(prov_repo_dir "$pi" "$repo"); [ -d "$dir" ] || continue
+    while IFS="$TAB" read -r path size; do
+      valid_rel "$path" || continue
+      src="$dir/$path"; [ -e "$src" ] || [ -L "$src" ] || continue
+      if real=$(prov_file_real "$pi" "$src") && [ -n "$real" ] && [ "$real" != "$src" ]; then safe_rm_under "${PP[pi]}" "$real" 2>/dev/null || true; fi
+      safe_rm_under "${PP[pi]}" "$src"
+    done <<< "${VFILES[i]}"
+    left=$(cd "$dir" && find . \( -type f -o -type l \) ! -name '.*' ! -path '*/.*' 2>/dev/null | head -1)
+    if [ -z "$left" ]; then
+      if [ "${PL[pi]}" = hfcache ]; then base=$(prov_base "$pi" "$repo"); safe_rm_under "${PP[pi]}" "$base"; else safe_rm_under "${PP[pi]}" "$dir"; fi
+    else find "$dir" -mindepth 1 -type d -empty -delete 2>/dev/null; fi
+    printf '  %s: removed\n' "$k"
+  done <<< "${VPROV[i]}"
+}
+
+consolidate() {  # after the primary store is settled: adopt stray provider copies, then make every provider a set of links
+  local i
+  for ((i=0;i<N;i++)); do
+    [ -n "${VPROV[i]}" ] || continue
+    case "${VLOCAL[i]}" in
+      cached|linked|partial) project_variant "$i" >/dev/null;;
+      absent) if printf '%s' "${VPROV[i]}" | grep -q "${TAB}real${TAB}"; then printf '\n%sAdopting %s from a provider copy%s\n' "$B" "${VID[i]}" "$R"; adopt_variant "$i"; project_variant "$i"; fi;;
+    esac
+  done
+}
+
 apply_one() {  # index, state
   local i="$1" s="$2" vid="${VID[$1]}" rc=0
   case "$s" in
-    cached) printf '\n%sCaching %s (%s)%s\n' "$B" "$vid" "$(hb "${VBYTES[i]}")" "$R"; do_cache "$i" || rc=1;;
-    linked) printf '\n%sLinking %s%s\n' "$B" "$vid" "$R"; do_link "$i" || rc=1;;
-    absent) printf '\n%sRemoving %s%s\n' "$B" "$vid" "$R"; do_remove "$i" || rc=1;;
+    cached) printf '\n%sCaching %s (%s)%s\n' "$B" "$vid" "$(hb "${VBYTES[i]}")" "$R"; adopt_variant "$i"; do_cache "$i" && project_variant "$i" || rc=1;;
+    linked) printf '\n%sLinking %s%s\n' "$B" "$vid" "$R"; do_link "$i" && project_variant "$i" || rc=1;;
+    absent) printf '\n%sRemoving %s%s\n' "$B" "$vid" "$R"; unproject_variant "$i"; do_remove "$i" || rc=1;;
   esac
   if [ $rc -eq 0 ]; then printf '%sdone%s\n' "$G" "$R"; else printf '%sfailed: %s%s\n' "$Y" "$vid" "$R" >&2; fi
   return $rc
@@ -635,8 +923,12 @@ apply_one() {  # index, state
 
 confirm_deletions() {  # args: indices; returns 1 if the user declines
   local i del=0 delbytes=0 ans
+  local k st b
   for i in "$@"; do
-    case "${VWANT[i]}" in linked|absent) if [ "${VREAL[i]:-0}" -gt 0 ]; then del=$((del+1)); delbytes=$((delbytes+VREAL[i])); fi;; esac
+    case "${VWANT[i]}" in linked|absent)
+      if [ "${VREAL[i]:-0}" -gt 0 ]; then del=$((del+1)); delbytes=$((delbytes+VREAL[i])); fi
+      while IFS="$TAB" read -r k st b; do [ -n "$k" ] && [ "${b:-0}" -gt 0 ] && { del=$((del+1)); delbytes=$((delbytes+b)); }; done <<< "${VPROV[i]}";;
+    esac
   done
   [ $del -eq 0 ] && return 0
   [ $YES -eq 1 ] && return 0
@@ -652,6 +944,8 @@ apply_pending() {
   confirm_deletions "${todo[@]}" || return 1
   for i in "${todo[@]}"; do apply_one "$i" "${VWANT[i]}"; done
   sync_state
+  [ $NP -gt 0 ] && { consolidate; sync_state; }
+  return 0
 }
 
 change_one() {
@@ -669,8 +963,13 @@ change_one() {
 
 # ----- uploads of local quants the library lacks -----
 upload_variant() {  # $1 = index into the foreign list
-  local i="$1" xid="${XID[$1]}" repo d f size have rc=0 json pid total count status
+  local i="$1" xid="${XID[$1]}" repo d f size have rc=0 json pid total count status pi rev="" src="${XSRC[$1]:-primary}"
   repo="${xid%@*}"; d="$MODELS_DIR/$repo"
+  if [ "$src" != primary ]; then
+    pi=$(prov_index "$src"); [ "$pi" -ge 0 ] || { echo "Unknown provider $src for $xid" >&2; return 1; }
+    d=$(prov_repo_dir "$pi" "$repo")
+    [ "${PL[pi]}" = hfcache ] && rev=$(prov_rev "$pi" "$repo") && [ "$rev" = lmscache ] && rev=""
+  fi
   count=$(printf '%s' "${XFILES[i]}" | grep -c .); total="${XBYTES[i]}"
   printf '\n%sUploading %s%s: %s in %s file(s) to the library\n' "$B" "$xid" "$R" "$(hb "$total")" "$count"
   status=$(curl -fsS "$NAS/api/upload/$repo") || { echo "LMS Cache refused the upload (is a download of this model running on the NAS?)" >&2; return 1; }
@@ -690,7 +989,7 @@ upload_variant() {  # $1 = index into the foreign list
   if [ $rc -ne 0 ]; then printf '%sUpload interrupted; run it again to resume.%s\n' "$Y" "$R" >&2; return 1; fi
   json=""
   while IFS="$TAB" read -r f size; do [ -n "$f" ] || continue; json="$json{\"path\":\"$(esc "$f")\",\"size\":$size},"; done <<< "${XFILES[i]}"
-  json="{\"machine\":\"$MACHINE\",\"files\":[${json%,}]}"
+  json="{\"machine\":\"$MACHINE\",\"revision\":\"$(esc "$rev")\",\"files\":[${json%,}]}"
   if printf '%s' "$json" | curl -fsS -X POST -H 'Content-Type: application/json' --data-binary @- "$NAS/api/upload/$repo/commit" >/dev/null; then
     printf '%sAdded %s to the library.%s\n' "$G" "$xid" "$R"
     sync_state
@@ -744,9 +1043,9 @@ commit_and_quit() {
     set_intent "${SIDS[i]}" "${SSTATES[i]}"; VWANT[idx]="${SSTATES[i]}"
   done
   SN=0; SIDS=(); SSTATES=()
-  local todo=() 
+  local todo=()
   for ((i=0;i<N;i++)); do is_pending "$i" && todo[${#todo[@]}]="$i"; done
-  if [ ${#todo[@]} -gt 0 ]; then apply_pending; else sync_state; fi
+  if [ ${#todo[@]} -gt 0 ]; then apply_pending; elif [ $NP -gt 0 ]; then consolidate; sync_state; else sync_state; fi
   if [ $STAGE_MOUNT -eq 1 ]; then STAGE_MOUNT=0; setup_mount; fi
   reported
 }
@@ -811,13 +1110,14 @@ main() {
     echo "LM Studio models folder not found at $MODELS_DIR. Edit this machine in LMS Cache if the path is different." >&2
     exit 1
   fi
+  boot_providers
   if [ $REPORT_ONLY -eq 1 ]; then sync_state && reported; exit $?; fi
   ensure_mount || printf '%sThe library share is not mounted; caching and linking will fail until it is.%s\n' "$Y" "$R"
   sync_state || exit 1
   if [ -n "$UPLOAD" ]; then upload_by_id "$UPLOAD"; rc=$?; reported; exit $rc; fi
   if [ $AUTO -eq 1 ]; then
     render
-    [ $PEND -gt 0 ] && apply_pending
+    if [ $PEND -gt 0 ]; then apply_pending; elif [ $NP -gt 0 ]; then consolidate; sync_state; fi
     reported
     exit 0
   fi

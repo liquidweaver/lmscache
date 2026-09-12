@@ -136,3 +136,11 @@ ul.files li span:last-child { margin-left: auto; color: var(--muted); }
 .empty { padding: 28px; text-align: center; color: var(--muted); }
 .tag.quant { font-family: var(--mono); color: var(--text); background: var(--accent-soft); border-color: transparent; }
 table.grid tr.repo-more td.model { color: var(--muted); }
+fieldset.providers { border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px 10px; margin: 10px 0; max-width: 560px; }
+fieldset.providers legend { font-weight: 600; padding: 0 4px; }
+fieldset.providers .prov { display: grid; grid-template-columns: 220px 1fr; gap: 8px; align-items: center; margin: 6px 0; }
+fieldset.providers .prov label { font-weight: normal; margin: 0; }
+fieldset.providers .prov input[type=text] { width: 100%; }
+.provs { font-size: 11.5px; color: var(--muted); margin-top: 3px; white-space: nowrap; }
+.provs b { color: var(--ok); font-weight: 600; }
+.provs i { color: var(--warn); font-style: normal; }

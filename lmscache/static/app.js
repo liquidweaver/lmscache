@@ -153,6 +153,17 @@
     if (rep === "partial") html += `<div class="sub warn">partial: ${hb(cell.bytes)} of ${hb(totalBytes)}</div>`;
     else if (cell.pending) html += `<div class="sub pending">wanted: ${esc(intent)}</div>`;
     else if (unknown && intent) html += `<div class="sub">wanted: ${esc(intent)}, no report yet</div>`;
+    const provs = Object.entries(cell.providers || {});
+    if (provs.length) {
+      const kinds = S.data.provider_kinds || {};
+      html += `<div class="provs">${provs.map(([k, p]) => {
+        const label = esc((kinds[k] || {}).label || k).replace(/ \(.*$/, "");
+        if (p.state === "linked") return `<b title="${label}: symlinks to the local copy">${label} ✓</b>`;
+        if (p.state === "real") return `<i title="${label} holds its own copy; it is adopted on the next commit">${label} copy</i>`;
+        if (p.state === "partial") return `<i title="${label}: incomplete">${label} partial</i>`;
+        return `<span title="${label}: not present">${label} –</span>`;
+      }).join(" · ")}</div>`;
+    }
     return html;
   }
 
@@ -226,6 +237,7 @@
           <div class="kv">
             <div>Models folder</div><div><code>${esc(m.models_dir)}</code></div>
             <div>Library mounted at</div><div><code>${esc(m.mount)}</code> <span class="muted">(share //${esc(d.settings.smb_host || "this host")}/${esc(d.settings.smb_share)} as ${esc(m.smb_user || d.settings.smb_user || "guest")})</span></div>
+            ${(m.providers || []).length ? `<div>Also serves</div><div>${m.providers.map((pv) => `${esc(((d.provider_kinds || {})[pv.kind] || {}).label || pv.kind)} at <code>${esc(pv.path)}</code>`).join("<br>")}</div>` : ""}
           </div>
           <div class="row"><span class="muted">Run in a terminal on ${esc(m.name)}:</span><button data-copy="${esc(m.one_liner)}">Copy</button></div>
           <code class="cmd">${esc(m.one_liner)}</code>
@@ -236,6 +248,7 @@
     }
     const form = $("#machine-form");
     const det = $("#add-machine");
+    renderProviderFields();
     if (S.editing) {
       const m = d.machines.find((x) => x.name === S.editing);
       if (m) {
@@ -244,6 +257,11 @@
         form.editing.value = m.name; form.name.value = m.name;
         form.os.value = m.os; form.models_dir.value = m.models_dir; form.mount.value = m.mount;
         form.smb_user.value = m.smb_user || "";
+        for (const pv of m.providers || []) {
+          const cb = form.querySelector(`[data-prov-kind="${pv.kind}"] input[type=checkbox]`);
+          const path = form.querySelector(`[data-prov-kind="${pv.kind}"] input[type=text]`);
+          if (cb) { cb.checked = true; path.value = pv.path; path.disabled = false; }
+        }
       }
     } else {
       det.querySelector("summary").textContent = "Add a machine";
@@ -251,16 +269,38 @@
     }
   }
 
+  function renderProviderFields() {
+    const box = $("#provider-fields");
+    if (box.dataset.ready) return;
+    const kinds = S.data.provider_kinds || {};
+    box.innerHTML = Object.entries(kinds).map(([k, v]) => `<div class="prov" data-prov-kind="${esc(k)}">
+        <label><input type="checkbox" data-prov-enable="${esc(k)}"> ${esc(v.label)}</label>
+        <input type="text" placeholder="${esc(v.default)}" value="${esc(v.default)}" disabled>
+      </div>`).join("");
+    box.addEventListener("change", (ev) => {
+      if (!ev.target.dataset.provEnable) return;
+      const path = ev.target.closest(".prov").querySelector("input[type=text]");
+      path.disabled = !ev.target.checked;
+    });
+    box.dataset.ready = "1";
+  }
+
+  function providerValues(form) {
+    return $$("#provider-fields .prov", form).filter((row) => row.querySelector("input[type=checkbox]").checked)
+      .map((row) => ({ kind: row.dataset.provKind, path: row.querySelector("input[type=text]").value.trim() || null }));
+  }
+
   async function saveMachine(ev) {
     ev.preventDefault();
     const f = ev.target;
     const body = {
       name: f.name.value.trim(), rename_from: f.editing.value || null, os: f.os.value, models_dir: f.models_dir.value.trim() || null, mount: f.mount.value.trim() || null,
-      smb_user: f.smb_user.value.trim() || null,
+      smb_user: f.smb_user.value.trim() || null, providers: providerValues(f),
     };
     try {
       await api("/api/machines", { method: "POST", body: JSON.stringify(body) });
       toast(`Saved ${body.name}.`);
+      $$("#provider-fields input[type=checkbox]").forEach((cb) => { cb.checked = false; cb.closest(".prov").querySelector("input[type=text]").disabled = true; });
       if (body.rename_from && S.machine === body.rename_from) { S.machine = body.name; localStorage.setItem("lmsc.machine", S.machine); }
       S.editing = null; f.reset(); $("#add-machine").open = false;
       if (!S.machine) S.machine = body.name;
@@ -361,7 +401,7 @@
     }
     if (t.id === "drawer-close") { closeDrawer(); return; }
     if (t.id === "rescan") { try { const r = await api("/api/library/rescan", { method: "POST" }); toast(`Rescanned: ${r.count} repos.`); await refresh(); } catch (e) { toast(e.message, true); } return; }
-    if (t.id === "machine-cancel") { S.editing = null; $("#machine-form").reset(); $("#add-machine").open = false; render(); return; }
+    if (t.id === "machine-cancel") { S.editing = null; $("#machine-form").reset(); $$("#provider-fields input[type=text]").forEach((i) => { i.disabled = true; }); $("#add-machine").open = false; render(); return; }
     if (t.closest("#lib-fmt") && t.dataset.fmt) { S.fmt = t.dataset.fmt; $$("#lib-fmt button").forEach((b) => b.classList.toggle("on", b === t)); render(); return; }
   });
   document.addEventListener("keydown", (ev) => { if (ev.key === "Escape") closeDrawer(); });

@@ -36,6 +36,11 @@ the machine that has them; the NAS holds the library and the machines hold only 
   what you want: **Not available**, **Cached locally** (a copy on that machine's disk) or **Linked** (per-file
   symlinks into the share, so the files load straight off the NAS). One folder can hold a cached quant next to a
   linked one.
+- **One local copy for every runtime on a machine.** Besides LM Studio, a machine can list other model stores:
+  oMLX, vLLM, or a plain Hugging Face cache (mlx-lm, transformers). A quant that is Cached or Linked on the
+  machine is projected into each compatible store as symlinks, in that store's own layout, so oMLX and LM Studio
+  share one file set. A copy that already lives in one of those stores is adopted into the LM Studio folder and
+  replaced by symlinks, and models that exist only there can be uploaded to the library like any other.
 - **One command per machine, nothing installed.** The command fetches a script generated for that machine and runs
   it. The script mounts the share, applies the wanted states, and reports back. Every run uses the current version.
 - **No agents, no daemons.** The only long-running piece is the container on the NAS.
@@ -66,6 +71,28 @@ classifies each library quant from its own files: all present as real files is C
 Linked, some missing or short is *partial*, none is Not available. A wanted state that differs shows as pending.
 Files in a repo folder that belong to no library quant, say a Q4 you downloaded yourself next to the library's
 Q8, appear as a local quant you can upload. Empty folders are ignored.
+
+### Providers: other model stores on a machine
+
+The LM Studio folder is the machine's primary store. A machine profile can add providers:
+
+| Provider | Layout | Gets which quants | Default path |
+|---|---|---|---|
+| oMLX | `publisher/repo/` folders, like LM Studio | MLX | `~/.omlx/models` |
+| vLLM | Hugging Face cache: `models--org--repo/refs/main` naming `snapshots/<rev>/` | safetensors | `~/.cache/huggingface/hub` |
+| Hugging Face cache | same as vLLM | MLX and safetensors | `~/.cache/huggingface/hub` |
+
+The script scans every provider along with the primary store and reports both. Symlinks are classified by where they
+point: into the primary store, into the share, or at data the provider itself owns (a Hugging Face blob counts as the
+provider's own copy). On every commit the script then **consolidates**: a real copy in a provider is moved into the
+primary store and replaced by symlinks (a cache's `refs/main` and revision folder are kept), and every quant that is
+Cached or Linked in the primary store is linked into each compatible provider. Not available removes the quant from
+the providers too; an empty Hugging Face cache entry is deleted whole.
+
+Uploading a model that only a provider has works the same way, and when it comes from a Hugging Face cache the real
+commit revision is recorded and reused for the cache folder on other machines. Quants without a known revision use a
+folder named `lmscache`, which loads fine offline; run vLLM with `HF_HUB_OFFLINE=1` in that case, or it will look for
+the model on the Hub.
 
 ### The client script
 
@@ -121,6 +148,8 @@ speed and time left, measured from bytes that actually landed.
   as `u2`, to upload it. The copy you already have then counts as Cached, and every other machine can now Cache or
   Link it.
 - MLX repos upload as one quant; GGUF repos upload one quant at a time, plus a vision projector if the folder has one.
+- On a machine that also runs oMLX or vLLM, add those stores to its profile on the Machines page. The next commit
+  adopts their copies into the LM Studio folder and links everything back, so each model exists once on that disk.
 
 **Keeping the matrix truthful**
 

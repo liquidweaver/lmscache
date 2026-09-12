@@ -56,6 +56,11 @@ class SettingsIn(BaseModel):
     smb_password: str | None = None
 
 
+class ProviderIn(BaseModel):
+    kind: str
+    path: str | None = None
+
+
 class MachineIn(BaseModel):
     name: str
     rename_from: str | None = None
@@ -63,6 +68,7 @@ class MachineIn(BaseModel):
     models_dir: str | None = None
     mount: str | None = None
     smb_user: str | None = None
+    providers: list[ProviderIn] | None = None
 
 
 class IntentIn(BaseModel):
@@ -77,6 +83,7 @@ class UploadFileIn(BaseModel):
 class CommitIn(BaseModel):
     files: list[UploadFileIn]
     machine: str | None = None
+    revision: str | None = None
 
 
 # ----- helpers -----
@@ -121,6 +128,7 @@ def _state_payload(request: Request) -> dict:
         "cells": machines.cells(models, names, intents, reports),
         "foreign": machines.foreign(models, reports),
         "settings": config.public(settings),
+        "provider_kinds": machines.PROVIDER_KINDS,
         "disk": catalog.disk(),
         "library_dir": str(config.LIBRARY_DIR),
         "base_url": base,
@@ -256,7 +264,7 @@ async def upload_file(publisher: str, repo: str, path: str, request: Request):
 async def upload_commit(publisher: str, repo: str, body: CommitIn):
     mid = _model_id(publisher, repo)
     try:
-        model = await asyncio.to_thread(uploads.commit, mid, [f.model_dump() for f in body.files], body.machine)
+        model = await asyncio.to_thread(uploads.commit, mid, [f.model_dump() for f in body.files], body.machine, body.revision)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     return model
@@ -333,13 +341,13 @@ async def report(name: str, request: Request):
         raise HTTPException(400, "body must be JSON")
     rep = machines.store_report(name, payload if isinstance(payload, dict) else {})
     bus.notify()
-    return machines.plan_text(catalog.models(), name, rep)
+    return machines.plan_text(catalog.models(), name, rep, machines.get(name))
 
 
 @app.get("/api/machines/{name}/plan", response_class=PlainTextResponse)
 async def plan(name: str):
-    _machine(name)
-    return machines.plan_text(catalog.models(), name, machines.reports().get(name))
+    m = _machine(name)
+    return machines.plan_text(catalog.models(), name, machines.reports().get(name), m)
 
 
 @app.get("/lmsc/{name}.sh", response_class=PlainTextResponse)

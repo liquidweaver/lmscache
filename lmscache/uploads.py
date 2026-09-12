@@ -88,7 +88,7 @@ async def receive(repo_id: str, rel: str, request, start: int) -> int:
     return target.stat().st_size
 
 
-def commit(repo_id: str, files: list[dict], machine: str | None) -> dict | None:
+def commit(repo_id: str, files: list[dict], machine: str | None, revision: str | None = None) -> dict | None:
     root = scratch_dir(repo_id)
     if not root.exists():
         raise ValueError("nothing has been uploaded for this model")
@@ -112,6 +112,8 @@ def commit(repo_id: str, files: list[dict], machine: str | None) -> dict | None:
     catalog.place(root, repo_id, clean)
     meta = db.get_json("models", "id", repo_id) or {}
     meta.update({"added_at": meta.get("added_at") or time.time(), "source": {"kind": "upload", "machine": machine, "at": time.time()}})
+    if revision and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", revision):
+        meta["revision"] = revision
     catalog.remember(repo_id, meta)
     catalog.scan()
     bus.notify()
