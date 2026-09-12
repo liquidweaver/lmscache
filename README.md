@@ -89,6 +89,9 @@ primary store and replaced by symlinks (a cache's `refs/main` and revision folde
 Cached or Linked in the primary store is linked into each compatible provider. Not available removes the quant from
 the providers too; an empty Hugging Face cache entry is deleted whole.
 
+oMLX also scans the Hugging Face cache, so on a machine that lists both, MLX quants are placed in oMLX's own folder
+only and the cache store receives plain safetensors; otherwise oMLX would list every model twice.
+
 Uploading a model that only a provider has works the same way, and when it comes from a Hugging Face cache the real
 commit revision is recorded and reused for the cache folder on other machines. Quants without a known revision use a
 folder named `lmscache`, which loads fine offline; run vLLM with `HF_HUB_OFFLINE=1` in that case, or it will look for

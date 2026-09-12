@@ -244,6 +244,17 @@ def compatible(kind: str, fmt: str) -> bool:
     return fmt in PROVIDER_KINDS.get(kind, {}).get("formats", [])
 
 
+def wanted_in(machine: dict | None, kind: str, fmt: str) -> bool:
+    """Should this machine's provider hold quants of this format? oMLX also scans the Hugging Face cache, so when both
+    are configured MLX quants live only in oMLX's own folder, or oMLX would list every model twice."""
+    if not compatible(kind, fmt):
+        return False
+    kinds = {p["kind"] for p in (machine or {}).get("providers") or []}
+    if fmt == "mlx" and kind in ("hfcache", "vllm") and "omlx" in kinds:
+        return False
+    return True
+
+
 def classify(models: dict[str, dict], report: dict | None) -> tuple[dict[str, dict], list[dict]]:
     """Per library variant: reported state in the primary store, per-provider state, real bytes; plus local
     variants the library lacks, from the primary store or any provider."""
@@ -300,14 +311,17 @@ def classify(models: dict[str, dict], report: dict | None) -> tuple[dict[str, di
 
 def cells(models: dict[str, dict], machine_names: list[str], intents_map: dict, reports_map: dict) -> dict:
     out: dict[str, dict[str, dict]] = {}
+    variant_format = {v["id"]: m["format"] for m in models.values() for v in m["variants"]}
     for name in machine_names:
+        machine = get(name)
         states, _ = classify(models, reports_map.get(name))
         my = intents_map.get(name, {})
         row: dict[str, dict] = {}
         for vid, st in states.items():
             intent = (my.get(vid) or {}).get("state")
             reported = st["reported"]
-            row[vid] = {"reported": reported, "bytes": st["bytes"], "intent": intent, "pending": bool(intent) and (reported is None or intent != reported), "providers": st.get("providers", {})}
+            provs = {k: {**v, "wanted": wanted_in(machine, k, variant_format.get(vid, ""))} for k, v in (st.get("providers") or {}).items()}
+            row[vid] = {"reported": reported, "bytes": st["bytes"], "intent": intent, "pending": bool(intent) and (reported is None or intent != reported), "providers": provs}
         out[name] = row
     return out
 
@@ -342,7 +356,8 @@ def plan_text(models: dict[str, dict], machine_name: str, report: dict | None, m
             for prov in provs:
                 if compatible(prov["kind"], m["format"]):
                     ps = (st.get("providers") or {}).get(prov["kind"]) or {"state": "-", "bytes": 0}
-                    lines.append("\t".join(["PV", v["id"], prov["kind"], ps["state"] or "-", str(ps["bytes"])]))
+                    want = "yes" if wanted_in(machine, prov["kind"], m["format"]) else "no"
+                    lines.append("\t".join(["PV", v["id"], prov["kind"], ps["state"] or "-", str(ps["bytes"]), want]))
         for f in m.get("shared") or []:
             if _clean_path(f["path"]):
                 lines.append("\t".join(["S", m["id"], f["path"], str(f["size"])]))
@@ -671,7 +686,7 @@ parse_plan() {
       P) PK[np]="$a"; PP[np]="$(expand_home "$b")"; PL[np]="$c"; np=$((np+1));;
       V) VID[N]="$a"; VBYTES[N]="${b:-0}"; VLOCAL[N]="$c"; VWANT[N]="$d"; VREAL[N]="${e:-0}"; VFILES[N]=""; VPROV[N]=""; cur=$N; N=$((N+1));;
       F) [ $cur -ge 0 ] && VFILES[cur]="${VFILES[cur]}$b$TAB$c"$'\n';;
-      PV) [ $cur -ge 0 ] && VPROV[cur]="${VPROV[cur]}$b$TAB$c$TAB${d:-0}"$'\n';;
+      PV) [ $cur -ge 0 ] && VPROV[cur]="${VPROV[cur]}$b$TAB$c$TAB${d:-0}$TAB${e:-yes}"$'\n';;
       S) SFILES="$SFILES$a$TAB$b$TAB$c"$'\n';;
       R) RREV="$RREV$a$TAB$b"$'\n';;
       X) XID[NX]="$a"; XBYTES[NX]="${b:-0}"; XSRC[NX]="${c:-primary}"; XFILES[NX]=""; xcur=$NX; NX=$((NX+1));;
@@ -735,10 +750,11 @@ render() {
   fi
 }
 
-prov_summary() {  # short list of providers that hold this variant: kind, kind(real) for an unadopted local copy
-  local k st b out=""
-  while IFS="$TAB" read -r k st b; do
+prov_summary() {  # short list of providers that hold this variant: kind, kind(copy) for an unadopted local copy
+  local k st b w out=""
+  while IFS="$TAB" read -r k st b w; do
     [ -n "$k" ] || continue
+    [ "${w:-yes}" = no ] && [ "$st" != real ] && continue
     case "$st" in real) out="$out${out:+,}$k(copy)";; linked) out="$out${out:+,}$k";; partial) out="$out${out:+,}$k(part)";; esac
   done <<< "${VPROV[$1]}"
   printf '%s' "$out"
@@ -833,12 +849,34 @@ prov_file_real() {  # $1 = provider index, $2 = file path in the store -> prints
   elif [ -f "$p" ]; then printf '%s' "$p"; else return 1; fi
 }
 
-project_variant() {  # $1 = variant index. Every compatible provider ends up holding this quant as symlinks to the primary files.
-  local i="$1" vid="${VID[$1]}" repo pi k st b dir path size src real prim rev base
+unproject_one() {  # $1 = variant index, $2 = provider index: drop this quant from that store, and the container if now empty
+  local i="$1" pi="$2" vid="${VID[$1]}" repo dir path size src real base left
+  repo="${vid%@*}"
+  dir=$(prov_repo_dir "$pi" "$repo"); [ -d "$dir" ] || return 0
+  while IFS="$TAB" read -r path size; do
+    valid_rel "$path" || continue
+    src="$dir/$path"; [ -e "$src" ] || [ -L "$src" ] || continue
+    if real=$(prov_file_real "$pi" "$src") && [ -n "$real" ] && [ "$real" != "$src" ]; then safe_rm_under "${PP[pi]}" "$real" 2>/dev/null || true; fi
+    safe_rm_under "${PP[pi]}" "$src"
+  done <<< "$(printf '%s' "${VFILES[i]}"; shared_for "$repo")"
+  left=$(cd "$dir" && find . \( -type f -o -type l \) ! -name '.*' ! -path '*/.*' 2>/dev/null | head -1)
+  if [ -z "$left" ]; then
+    if [ "${PL[pi]}" = hfcache ]; then base=$(prov_base "$pi" "$repo"); safe_rm_under "${PP[pi]}" "$base"; else safe_rm_under "${PP[pi]}" "$dir"; fi
+  else find "$dir" -mindepth 1 -type d -empty -delete 2>/dev/null; fi
+  printf '  %s: removed\n' "${PK[pi]}"
+}
+
+project_variant() {  # $1 = variant index. Every provider that should hold this quant gets symlinks to the primary files; others lose it.
+  local i="$1" vid="${VID[$1]}" repo pi k st b w dir path size src real prim rev base
   repo="${vid%@*}"; prim="$MODELS_DIR/$repo"
-  while IFS="$TAB" read -r k st b; do
+  while IFS="$TAB" read -r k st b w; do
     [ -n "$k" ] || continue
     pi=$(prov_index "$k"); [ "$pi" -ge 0 ] || continue
+    if [ "${w:-yes}" = no ]; then
+      # another store on this machine serves the same runtime; keep only one entry (real copies are adopted first)
+      case "$st" in linked|partial|real) unproject_one "$i" "$pi";; esac
+      continue
+    fi
     [ -d "${PP[pi]}" ] || mkdir -p "${PP[pi]}" 2>/dev/null || { echo "  cannot create ${PP[pi]} for $k" >&2; continue; }
     dir=$(prov_repo_dir "$pi" "$repo")
     if [ "${PL[pi]}" = hfcache ]; then
@@ -866,7 +904,7 @@ project_variant() {  # $1 = variant index. Every compatible provider ends up hol
 adopt_variant() {  # $1 = variant index. Real files a provider holds move into the primary store (no copy from the NAS needed).
   local i="$1" vid="${VID[$1]}" repo pi k st b dir path size src real prim moved=0
   repo="${vid%@*}"; prim="$MODELS_DIR/$repo"
-  while IFS="$TAB" read -r k st b; do
+  while IFS="$TAB" read -r k st b w; do
     [ -n "$k" ] || continue
     case "$st" in real|partial) ;; *) continue;; esac
     pi=$(prov_index "$k"); [ "$pi" -ge 0 ] || continue
@@ -888,24 +926,12 @@ adopt_variant() {  # $1 = variant index. Real files a provider holds move into t
   return 0
 }
 
-unproject_variant() {  # $1 = variant index. Remove this quant from every provider; drop empty containers.
-  local i="$1" vid="${VID[$1]}" repo pi k st b dir path size src real base left
-  repo="${vid%@*}"
-  while IFS="$TAB" read -r k st b; do
+unproject_variant() {  # $1 = variant index. Remove this quant from every provider.
+  local i="$1" k st b w pi
+  while IFS="$TAB" read -r k st b w; do
     [ -n "$k" ] || continue
     pi=$(prov_index "$k"); [ "$pi" -ge 0 ] || continue
-    dir=$(prov_repo_dir "$pi" "$repo"); [ -d "$dir" ] || continue
-    while IFS="$TAB" read -r path size; do
-      valid_rel "$path" || continue
-      src="$dir/$path"; [ -e "$src" ] || [ -L "$src" ] || continue
-      if real=$(prov_file_real "$pi" "$src") && [ -n "$real" ] && [ "$real" != "$src" ]; then safe_rm_under "${PP[pi]}" "$real" 2>/dev/null || true; fi
-      safe_rm_under "${PP[pi]}" "$src"
-    done <<< "${VFILES[i]}"
-    left=$(cd "$dir" && find . \( -type f -o -type l \) ! -name '.*' ! -path '*/.*' 2>/dev/null | head -1)
-    if [ -z "$left" ]; then
-      if [ "${PL[pi]}" = hfcache ]; then base=$(prov_base "$pi" "$repo"); safe_rm_under "${PP[pi]}" "$base"; else safe_rm_under "${PP[pi]}" "$dir"; fi
-    else find "$dir" -mindepth 1 -type d -empty -delete 2>/dev/null; fi
-    printf '  %s: removed\n' "$k"
+    unproject_one "$i" "$pi"
   done <<< "${VPROV[i]}"
 }
 
@@ -937,7 +963,7 @@ confirm_deletions() {  # args: indices; returns 1 if the user declines
   for i in "$@"; do
     case "${VWANT[i]}" in linked|absent)
       if [ "${VREAL[i]:-0}" -gt 0 ]; then del=$((del+1)); delbytes=$((delbytes+VREAL[i])); fi
-      while IFS="$TAB" read -r k st b; do [ -n "$k" ] && [ "${b:-0}" -gt 0 ] && { del=$((del+1)); delbytes=$((delbytes+b)); }; done <<< "${VPROV[i]}";;
+      while IFS="$TAB" read -r k st b w; do [ -n "$k" ] && [ "${b:-0}" -gt 0 ] && { del=$((del+1)); delbytes=$((delbytes+b)); }; done <<< "${VPROV[i]}";;
     esac
   done
   [ $del -eq 0 ] && return 0

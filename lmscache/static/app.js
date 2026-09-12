@@ -156,7 +156,7 @@
     const provs = Object.entries(cell.providers || {});
     if (provs.length) {
       const kinds = S.data.provider_kinds || {};
-      html += `<div class="provs">${provs.map(([k, p]) => {
+      html += `<div class="provs">${provs.filter(([k, p]) => p.wanted !== false || p.state === "real").map(([k, p]) => {
         const label = esc((kinds[k] || {}).label || k).replace(/ \(.*$/, "");
         if (p.state === "linked") return `<b title="${label}: symlinks to the local copy">${label} ✓</b>`;
         if (p.state === "real") return `<i title="${label} holds its own copy; it is adopted on the next commit">${label} copy</i>`;
